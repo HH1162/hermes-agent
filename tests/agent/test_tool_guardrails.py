@@ -188,9 +188,10 @@ def test_hard_stop_enabled_halts_same_tool_varying_args_failure_streak():
     assert third.count == 3
 
 
-def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_default():
+def test_all_tools_no_progress_warns_without_blocking_by_default():
+    """No-progress detection applies to all tools, not just idempotent ones."""
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
+        ToolCallGuardrailConfig(no_progress_warn_after=2)
     )
     args = {"path": "/tmp/same.txt"}
     result = "same file contents"
@@ -200,12 +201,14 @@ def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_defaul
         decision = controller.after_call("read_file", args, result, failed=False)
 
     assert decision.action == "warn"
-    assert decision.code == "idempotent_no_progress_warning"
+    assert decision.code == "no_progress_warning"
     assert controller.before_call("read_file", args).action == "allow"
     assert controller.halt_decision is None
 
 
-def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
+def test_hard_stop_enabled_nudges_then_blocks_no_progress():
+    """With hard_stop enabled, first hit returns nudge (lets tool run + injects user message),
+    after 2 consecutive nudges still repeating → truly blocks."""
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(
             hard_stop_enabled=True,
@@ -216,28 +219,57 @@ def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
     args = {"path": "/tmp/same.txt"}
     result = "same file contents"
 
+    # First call: no repeat yet
     assert controller.before_call("read_file", args).action == "allow"
     assert controller.after_call("read_file", args, result, failed=False).action == "allow"
+
+    # Second call: repeat_count=2, hits warn threshold
     assert controller.before_call("read_file", args).action == "allow"
     warn = controller.after_call("read_file", args, result, failed=False)
     assert warn.action == "warn"
-    assert warn.code == "idempotent_no_progress_warning"
+    assert warn.code == "no_progress_warning"
 
+    # Third before_call: repeat_count=2 >= block_threshold=2 → nudge (not block)
+    nudge_check = controller.before_call("read_file", args)
+    assert nudge_check.allows_execution  # nudge allows execution
+    # Execute the tool (it still runs)
+    controller.after_call("read_file", args, result, failed=False)
+
+    # Fourth before_call: nudge_count=1, still repeating → another nudge
+    nudge_check2 = controller.before_call("read_file", args)
+    assert nudge_check2.allows_execution
+    controller.after_call("read_file", args, result, failed=False)
+
+    # Fifth before_call: nudge_count=2 → truly block
     blocked = controller.before_call("read_file", args)
     assert blocked.action == "block"
-    assert blocked.code == "idempotent_no_progress_block"
+    assert blocked.code == "no_progress_block"
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
+def test_mutating_tools_are_tracked_for_no_progress():
+    """Mutating tools (write_file, terminal) are now also tracked for no-progress loops."""
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
     )
 
+    # write_file should now be tracked
     for _ in range(3):
         assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+        decision = controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False)
+    # Should warn after 2 repeats
+    assert decision.action == "warn"
+    assert decision.code == "no_progress_warning"
+
+
+def test_browser_has_higher_threshold():
+    """Browser tools use higher thresholds (30/15) to avoid false positives."""
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(hard_stop_enabled=True, no_progress_block_after=5)
+    )
+    assert controller._get_no_progress_block_after("browser_click") == 30
+    assert controller._get_no_progress_block_after("browser_navigate") == 30
+    assert controller._get_no_progress_block_after("terminal") == 5
+    assert controller._get_no_progress_block_after("read_file") == 5
 
 
 def test_reset_for_turn_clears_bounded_guardrail_state():
@@ -250,7 +282,9 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
     controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
 
     assert controller.before_call("web_search", {"query": "same"}).action == "block"
-    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "block"
+    # read_file returns nudge on first threshold hit (allows execution)
+    nudge_check = controller.before_call("read_file", {"path": "/tmp/x"})
+    assert nudge_check.allows_execution
 
     controller.reset_for_turn()
 

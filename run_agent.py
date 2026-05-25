@@ -4058,6 +4058,12 @@ class AIAgent:
             self._set_tool_guardrail_halt(decision)
         return function_result
 
+    def _take_nudge_and_inject(self, messages: list) -> None:
+        """Check for pending nudge from guardrail and inject user message."""
+        nudge = self._tool_guardrails.take_pending_nudge
+        if nudge is not None:
+            messages.append({"role": "user", "content": nudge.message})
+
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)

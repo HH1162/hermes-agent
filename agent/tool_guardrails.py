@@ -145,7 +145,7 @@ class ToolCallSignature:
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn | nudge | block | halt
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -154,7 +154,7 @@ class ToolGuardrailDecision:
 
     @property
     def allows_execution(self) -> bool:
-        return self.action in {"allow", "warn"}
+        return self.action in {"allow", "warn", "nudge"}
 
     @property
     def should_halt(self) -> bool:
@@ -232,7 +232,16 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._no_progress_nudge: dict[ToolCallSignature, int] = {}
+        self._pending_nudge: ToolGuardrailDecision | None = None
         self._halt_decision: ToolGuardrailDecision | None = None
+
+    @property
+    def take_pending_nudge(self) -> "ToolGuardrailDecision | None":
+        """Take and clear the pending nudge decision."""
+        nudge = self._pending_nudge
+        self._pending_nudge = None
+        return nudge
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
@@ -260,18 +269,24 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
-            record = self._no_progress.get(signature)
-            if record is not None:
-                _result_hash, repeat_count = record
-                if repeat_count >= self.config.no_progress_block_after:
+        # No-progress check applies to all tools (not just idempotent ones).
+        record = self._no_progress.get(signature)
+        if record is not None:
+            _result_hash, repeat_count = record
+            block_threshold = self._get_no_progress_block_after(tool_name)
+            nudge_count = self._no_progress_nudge.get(signature, 0)
+            if repeat_count >= block_threshold:
+                # First time reaching threshold: nudge (inject user message, don't block)
+                # After N consecutive nudges still repeating: truly block
+                if nudge_count >= 2:
                     decision = ToolGuardrailDecision(
                         action="block",
-                        code="idempotent_no_progress_block",
+                        code="no_progress_block",
                         message=(
-                            f"Blocked {tool_name}: this read-only call returned the same "
-                            f"result {repeat_count} times. Stop repeating it unchanged; "
-                            "use the result already provided or try a different query."
+                            f"Blocked {tool_name}: this call returned the same "
+                            f"result {repeat_count} times despite multiple warnings. "
+                            "Stop repeating it unchanged; use the result already provided "
+                            "or try a different approach."
                         ),
                         tool_name=tool_name,
                         count=repeat_count,
@@ -279,6 +294,18 @@ class ToolCallGuardrailController:
                     )
                     self._halt_decision = decision
                     return decision
+                else:
+                    # Nudge: let the tool execute but inject a user message after
+                    self._pending_nudge = ToolGuardrailDecision(
+                        action="nudge",
+                        code="no_progress_nudge",
+                        message="Are you stuck in a loop?",
+                        tool_name=tool_name,
+                        count=repeat_count,
+                        signature=signature,
+                    )
+                    self._no_progress_nudge[signature] = nudge_count + 1
+                    return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -347,10 +374,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
-        if not self._is_idempotent(tool_name):
-            self._no_progress.pop(signature, None)
-            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
-
+        # No-progress tracking applies to all tools (not just idempotent ones).
         result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
         repeat_count = 1
@@ -358,10 +382,15 @@ class ToolCallGuardrailController:
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
 
-        if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
+        # Reset nudge counter when the tool stops repeating
+        if repeat_count == 1:
+            self._no_progress_nudge.pop(signature, None)
+
+        warn_threshold = self._get_no_progress_warn_after(tool_name)
+        if self.config.warnings_enabled and repeat_count >= warn_threshold:
             return ToolGuardrailDecision(
                 action="warn",
-                code="idempotent_no_progress_warning",
+                code="no_progress_warning",
                 message=(
                     f"{tool_name} returned the same result {repeat_count} times. "
                     "Use the result already provided or change the query instead of "
@@ -373,6 +402,18 @@ class ToolCallGuardrailController:
             )
 
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+
+    def _get_no_progress_block_after(self, tool_name: str) -> int:
+        """Browser tools use higher threshold (30) to avoid false positives."""
+        if tool_name.startswith("browser_"):
+            return 30
+        return self.config.no_progress_block_after
+
+    def _get_no_progress_warn_after(self, tool_name: str) -> int:
+        """Browser tools use higher warn threshold (15)."""
+        if tool_name.startswith("browser_"):
+            return 15
+        return self.config.no_progress_warn_after
 
     def _is_idempotent(self, tool_name: str) -> bool:
         if tool_name in self.config.mutating_tools:
@@ -393,9 +434,11 @@ def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
 
 def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
     """Append runtime guidance to the current tool result content."""
-    if decision.action not in {"warn", "halt"} or not decision.message:
+    if decision.action not in {"warn", "halt", "nudge"} or not decision.message:
         return result
-    label = "Tool loop hard stop" if decision.action == "halt" else "Tool loop warning"
+    label = "Tool loop hard stop" if decision.action == "halt" else (
+        "Tool loop nudge" if decision.action == "nudge" else "Tool loop warning"
+    )
     suffix = (
         f"\n\n[{label}: "
         f"{decision.code}; count={decision.count}; {decision.message}]"

@@ -15178,6 +15178,12 @@ class GatewayRunner:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
+        # Delegate per-turn guardrails cleanup to the native reset_for_turn()
+        # in conversation_loop.py — it covers both original and nudge-specific
+        # fields (_no_progress_nudge, _pending_nudge) so we don't duplicate
+        # state management logic here.
+        if hasattr(agent, "_tool_guardrails"):
+            agent._tool_guardrails.reset_for_turn()
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.

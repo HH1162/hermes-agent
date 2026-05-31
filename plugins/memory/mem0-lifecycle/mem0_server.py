@@ -24,6 +24,7 @@ Cleanup config:
 """
 
 import json
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -36,13 +37,57 @@ HALF_LIFE_DAYS = 7.0       # Exponential decay half-life (days)
 CLEANUP_THRESHOLD = 0.05   # Memories with weighted_score < this are candidates for deletion
 ACCESS_COUNT_CAP = 255     # Hard cap on access_count — prevents unbounded growth
 
+# --- Time anchor: freezes decay while machine is offline ---
 
-def compute_weighted_score(access_count, last_accessed_iso):
-    """Exponential decay: score = min(count, CAP) * 0.5^(days_since / half_life)
+STATE_FILE = os.path.expanduser("~/.hermes/mem0_state.json")
 
-    Prevents infinite inflation: access_count is capped at 255, so even a
-    memory searched thousands of times has a bounded score.
-    Combined with half-life decay, old memories naturally fade to zero.
+
+def get_anchor_time():
+    """Get the system's last-active timestamp (time anchor).
+
+    This is the reference point for all decay calculations.
+    While the machine is offline, this timestamp does not advance,
+    effectively freezing memory decay during downtime.
+    """
+    try:
+        if os.path.exists(STATE_FILE):
+            state = json.loads(open(STATE_FILE).read())
+            ts = state.get("last_active", "")
+            if ts:
+                dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
+    except Exception:
+        pass
+    return datetime.now(timezone.utc)
+
+
+def update_anchor_time():
+    """Called on search/add to advance the time anchor.
+
+    Only invoked when the user is actively interacting with the system.
+    During downtime, this is never called, so the anchor stays frozen.
+    """
+    try:
+        state = {"last_active": datetime.now(timezone.utc).isoformat()}
+        tmp = STATE_FILE + ".tmp"
+        open(tmp, 'w').write(json.dumps(state, indent=2))
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
+def compute_weighted_score(access_count, last_accessed_iso, anchor_time=None):
+    """Exponential decay based on system active time, not physical wall-clock time.
+
+    score = min(access_count, CAP) * 0.5^(effective_days / half_life)
+
+    effective_days = (anchor_time - last_accessed_at)
+
+    When anchor_time is None, defaults to current wall-clock time.
+    During cleanup/stats, anchor_time is explicitly passed to ensure
+    consistent scoring across all memories in a single run.
 
     Timestamp parsing uses Python native fromisoformat + tzinfo check for
     robust handling of UTC, timezone-aware, naive, Z-suffix, and negative-offset
@@ -60,8 +105,15 @@ def compute_weighted_score(access_count, last_accessed_iso):
         last_dt = datetime.fromisoformat(ts)
         if last_dt.tzinfo is None:
             last_dt = last_dt.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        days = max(0, (now - last_dt).total_seconds() / 86400)
+
+        # Use anchor_time (last system activity) instead of wall-clock now()
+        # This freezes decay while the machine is offline
+        if anchor_time is None:
+            anchor_time = get_anchor_time()
+        elif anchor_time.tzinfo is None:
+            anchor_time = anchor_time.replace(tzinfo=timezone.utc)
+
+        days = max(0, (anchor_time - last_dt).total_seconds() / 86400)
         return float(min(access_count, ACCESS_COUNT_CAP)) * (0.5 ** (days / HALF_LIFE_DAYS))
     except Exception:
         # Timestamp parse failure -> treat as expired to avoid immortal zombies
@@ -178,6 +230,10 @@ def main():
 
     action = sys.argv[1]
 
+    # Advance time anchor on user-facing actions (search/add)
+    if action in ("search", "add"):
+        update_anchor_time()
+
     try:
         client = get_memory_client()
 
@@ -248,6 +304,9 @@ def main():
             user_id = sys.argv[2] if len(sys.argv) > 2 else "example-user"
             qdrant = QdrantClient(host='localhost', port=6333)
 
+            # Use time anchor for consistent scoring (not wall-clock now)
+            anchor = get_anchor_time()
+
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
@@ -274,7 +333,7 @@ def main():
                 if ac > max_access:
                     max_access = ac
 
-                w = compute_weighted_score(ac, la)
+                w = compute_weighted_score(ac, la, anchor_time=anchor)
                 total_weighted += w
                 max_weighted = max(max_weighted, w)
 
@@ -298,6 +357,8 @@ def main():
             top_n = int(sys.argv[3]) if len(sys.argv) > 3 else 10
             qdrant = QdrantClient(host='localhost', port=6333)
 
+            anchor = get_anchor_time()
+
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
@@ -309,7 +370,7 @@ def main():
             for m in results:
                 mem_id = str(m.get('id', ''))
                 ac, la = payload_map.get(mem_id, (0, 'never'))
-                w = compute_weighted_score(ac, la)
+                w = compute_weighted_score(ac, la, anchor_time=anchor)
                 with_stats.append({
                     'id': mem_id,
                     'memory': m.get('memory', '')[:120],
@@ -338,6 +399,8 @@ def main():
 
             qdrant = QdrantClient(host='localhost', port=6333)
 
+            anchor = get_anchor_time()
+
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
@@ -351,7 +414,7 @@ def main():
             for m in results:
                 mem_id = str(m.get('id', ''))
                 ac, la = payload_map.get(mem_id, (0, 'never'))
-                w = compute_weighted_score(ac, la)
+                w = compute_weighted_score(ac, la, anchor_time=anchor)
 
                 # Grace period: newly created memories (< 14 days old) are protected
                 grace_protected = False

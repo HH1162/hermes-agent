@@ -231,8 +231,12 @@ def batch_get_access_payload(qdrant, mem_ids):
                 payload.get('last_accessed_at', 'never')
             )
         return result
-    except Exception:
-        return {}
+    except Exception as e:
+        # CRITICAL: Never swallow Qdrant errors silently.
+        # If we return {} here, cleanup will see ac=0 for ALL memories
+        # and delete everything past the grace period (Fail-Deadly).
+        # Raising forces the caller to abort (Fail-Safe).
+        raise RuntimeError(f"Qdrant batch retrieve failed for {len(mem_ids)} memories: {e}")
 
 
 def main():
@@ -282,10 +286,10 @@ def main():
                                     },
                                     points=[mem_id]
                                 )
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                print(f"Warning: track access failed for {mem_id}: {e}", file=sys.stderr)
 
-            print(json.dumps(results))
+            print(json.dumps(results, default=str))
 
         elif action == "add":
             messages_json = sys.argv[2]
@@ -402,11 +406,19 @@ def main():
             user_id = 'example-user'
             threshold = CLEANUP_THRESHOLD
 
-            # Parse optional threshold
+            skip_next = False
             for i, arg in enumerate(args):
+                if skip_next:
+                    skip_next = False
+                    continue
+
                 if arg == '--threshold' and i + 1 < len(args):
-                    threshold = float(args[i + 1])
-                elif arg not in ('--dry-run', '--threshold') and not arg.startswith('-'):
+                    try:
+                        threshold = float(args[i + 1])
+                        skip_next = True  # Mark value as consumed so it won't become user_id
+                    except ValueError:
+                        pass
+                elif not arg.startswith('-'):
                     user_id = arg
 
             qdrant = QdrantClient(host='localhost', port=6333)
@@ -417,8 +429,16 @@ def main():
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
             # BATCH retrieve all payloads in one call (eliminates N+1 query problem)
+            # Circuit breaker: if Qdrant is down, abort cleanup entirely (Fail-Safe).
             mem_ids = [str(m.get('id', '')) for m in results if m.get('id')]
-            payload_map = batch_get_access_payload(qdrant, mem_ids)
+            try:
+                payload_map = batch_get_access_payload(qdrant, mem_ids)
+            except RuntimeError as e:
+                print(json.dumps({
+                    "error": str(e),
+                    "action": "ABORT_CLEANUP_TO_PREVENT_MASS_DELETION"
+                }))
+                sys.exit(1)
 
             candidates = []
             kept = []

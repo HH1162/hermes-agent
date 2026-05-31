@@ -48,7 +48,13 @@ def get_anchor_time():
     This is the reference point for all decay calculations.
     While the machine is offline, this timestamp does not advance,
     effectively freezing memory decay during downtime.
+
+    Includes sanity check: if the stored anchor or system clock is
+    before MIN_VALID_YEAR, it is considered corrupted (e.g. CMOS
+    battery failure, NTP desync) and a safe fallback is used.
     """
+    MIN_VALID_YEAR = 2024
+
     try:
         if os.path.exists(STATE_FILE):
             state = json.loads(open(STATE_FILE).read())
@@ -57,10 +63,16 @@ def get_anchor_time():
                 dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
-                return dt
+                if dt.year >= MIN_VALID_YEAR:
+                    return dt
     except Exception:
         pass
-    return datetime.now(timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    if now.year >= MIN_VALID_YEAR:
+        return now
+    # Extreme fallback: system clock itself is broken (e.g. CMOS dead)
+    return datetime(MIN_VALID_YEAR, 1, 1, tzinfo=timezone.utc)
 
 
 def update_anchor_time():
@@ -416,7 +428,9 @@ def main():
                 ac, la = payload_map.get(mem_id, (0, 'never'))
                 w = compute_weighted_score(ac, la, anchor_time=anchor)
 
-                # Grace period: newly created memories (< 14 days old) are protected
+                # Grace period: newly created memories (< 14 days old) are protected.
+                # Uses anchor_time as single source of truth instead of datetime.now()
+                # to remain resilient against system clock drift (NTP desync, CMOS failure).
                 grace_protected = False
                 created_at = m.get('created_at', '')
                 if created_at:
@@ -425,8 +439,7 @@ def main():
                         ca_dt = datetime.fromisoformat(ca_ts)
                         if ca_dt.tzinfo is None:
                             ca_dt = ca_dt.replace(tzinfo=timezone.utc)
-                        now = datetime.now(timezone.utc)
-                        days_old = (now - ca_dt).total_seconds() / 86400
+                        days_old = (anchor - ca_dt).total_seconds() / 86400
                         grace_protected = days_old < 14
                     except Exception:
                         # If timestamp parsing fails, default to protecting the memory

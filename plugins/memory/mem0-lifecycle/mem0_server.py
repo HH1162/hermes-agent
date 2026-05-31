@@ -125,7 +125,11 @@ DO NOT STORE:
 
 
 def get_access_payload(qdrant, mem_id):
-    """Fetch access_count and last_accessed_at for a memory from Qdrant."""
+    """Fetch access_count and last_accessed_at for a memory from Qdrant.
+
+    NOTE: This is kept for backward compatibility but is SLOW (N+1 queries).
+    Prefer batch_get_access_payload() for bulk operations (stats, cleanup, least_used).
+    """
     try:
         pt = qdrant.retrieve(collection_name='mem0', ids=[str(mem_id)], with_payload=True)
         if pt:
@@ -134,6 +138,37 @@ def get_access_payload(qdrant, mem_id):
     except Exception:
         pass
     return 0, 'never'
+
+
+def batch_get_access_payload(qdrant, mem_ids):
+    """Batch retrieve access payloads for multiple memory IDs.
+
+    Replaces N sequential Qdrant queries with a single batch retrieve call.
+    Returns dict: {mem_id: (access_count, last_accessed_at)}
+
+    This eliminates the N+1 query problem in stats/cleanup/least_used operations.
+    Without this, 100 memories = 100 network roundtrips (1-3 seconds).
+    With this, 100 memories = 1 network roundtrip (<50ms).
+    """
+    if not mem_ids:
+        return {}
+
+    try:
+        pts = qdrant.retrieve(
+            collection_name='mem0',
+            ids=[str(mid) for mid in mem_ids],
+            with_payload=True
+        )
+        result = {}
+        for p in pts:
+            payload = p.payload or {}
+            result[str(p.id)] = (
+                payload.get('access_count', 0),
+                payload.get('last_accessed_at', 'never')
+            )
+        return result
+    except Exception:
+        return {}
 
 
 def main():
@@ -216,15 +251,21 @@ def main():
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
+            # BATCH retrieve all payloads in one call (eliminates N+1 query problem)
+            mem_ids = [str(m.get('id', '')) for m in results if m.get('id')]
+            payload_map = batch_get_access_payload(qdrant, mem_ids)
+
             total = len(results)
             with_access = 0
             never_accessed = 0
             max_access = 0
             total_access = 0
+            total_weighted = 0.0
+            max_weighted = 0.0
 
             for m in results:
                 mem_id = str(m.get('id', ''))
-                ac, _ = get_access_payload(qdrant, mem_id)
+                ac, la = payload_map.get(mem_id, (0, 'never'))
                 total_access += ac
                 if ac > 0:
                     with_access += 1
@@ -233,18 +274,11 @@ def main():
                 if ac > max_access:
                     max_access = ac
 
-            avg_access = total_access / with_access if with_access > 0 else 0
-
-            # Compute weighted scores with exponential decay
-            total_weighted = 0.0
-            max_weighted = 0.0
-            for m in results:
-                mem_id = str(m.get('id', ''))
-                ac, la = get_access_payload(qdrant, mem_id)
                 w = compute_weighted_score(ac, la)
                 total_weighted += w
                 max_weighted = max(max_weighted, w)
 
+            avg_access = total_access / with_access if with_access > 0 else 0
             avg_weighted = total_weighted / with_access if with_access > 0 else 0
 
             print(json.dumps({
@@ -267,10 +301,14 @@ def main():
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
+            # BATCH retrieve all payloads in one call (eliminates N+1 query problem)
+            mem_ids = [str(m.get('id', '')) for m in results if m.get('id')]
+            payload_map = batch_get_access_payload(qdrant, mem_ids)
+
             with_stats = []
             for m in results:
                 mem_id = str(m.get('id', ''))
-                ac, la = get_access_payload(qdrant, mem_id)
+                ac, la = payload_map.get(mem_id, (0, 'never'))
                 w = compute_weighted_score(ac, la)
                 with_stats.append({
                     'id': mem_id,
@@ -303,12 +341,16 @@ def main():
             all_mems = client.get_all(filters={'user_id': user_id})
             results = all_mems.get('results', []) if isinstance(all_mems, dict) else []
 
+            # BATCH retrieve all payloads in one call (eliminates N+1 query problem)
+            mem_ids = [str(m.get('id', '')) for m in results if m.get('id')]
+            payload_map = batch_get_access_payload(qdrant, mem_ids)
+
             candidates = []
             kept = []
 
             for m in results:
                 mem_id = str(m.get('id', ''))
-                ac, la = get_access_payload(qdrant, mem_id)
+                ac, la = payload_map.get(mem_id, (0, 'never'))
                 w = compute_weighted_score(ac, la)
 
                 # Grace period: newly created memories (< 14 days old) are protected

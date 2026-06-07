@@ -14,6 +14,7 @@ Config via environment variables:
 
 Or via $HERMES_HOME/mem0.json.
 """
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +28,16 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_text(text: str) -> str:
+    """Normalize text for hash-based dedup: strip punctuation, collapse whitespace, lowercase."""
+    return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', text.strip())).lower()
+
+
+def _text_hash(text: str) -> str:
+    """MD5 hash of normalized text for O(N) exact-duplicate detection."""
+    return hashlib.md5(_normalize_text(text).encode('utf-8')).hexdigest()
 
 # Circuit breaker: after this many consecutive failures, pause API calls
 # for _BREAKER_COOLDOWN_SECS to avoid hammering a down server.
@@ -52,11 +63,11 @@ def _load_config() -> dict:
         "rerank": True,
         "keyword_search": False,
         # Local mode paths — local defaults overridden by mem0.json/env vars
-        "mem0_server": os.environ.get("MEM0_SERVER", "/opt/mem0/mem0_server.py"),
-        "mem0_python": os.environ.get("MEM0_PYTHON", "/opt/mem0/.venv/bin/python"),
+        "mem0_server": os.environ.get("MEM0_SERVER", ""),  # e.g. /path/to/mem0/mem0_server.py
+        "mem0_python": os.environ.get("MEM0_PYTHON", ""),  # e.g. /path/to/mem0/.venv/bin/python
         "llm_base_url": os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
         "llm_model": os.environ.get("LLM_MODEL", "qwen3"),
-        "embedder_model": os.environ.get("EMBEDDER_MODEL", "/opt/models/bge-large-zh-v1.5"),
+        "embedder_model": os.environ.get("EMBEDDER_MODEL", "bge-large-zh-v1.5"),  # local path or model name
         "embedding_dims": int(os.environ.get("EMBEDDING_DIMS", "1024")),
         "qdrant_host": os.environ.get("QDRANT_HOST", "localhost"),
         "qdrant_port": int(os.environ.get("QDRANT_PORT", "6333")),
@@ -197,7 +208,7 @@ class Mem0MemoryProvider(MemoryProvider):
                         'embedder': {
                             'provider': 'huggingface',
                             'config': {
-                                'model': cfg.get("embedder_model", "/opt/models/bge-large-zh-v1.5")
+                                'model': cfg.get("embedder_model", "bge-large-zh-v1.5")  # local path or model name
                             }
                         },
                         'vector_store': {
@@ -351,6 +362,11 @@ class Mem0MemoryProvider(MemoryProvider):
                     return clean.lower()
             return None
 
+        # _is_config_conflict returns (is_conflict, entity_type, reason)
+        # entity_type: 'endpoint' | 'version' | 'path' | 'other' | ''
+        # endpoint (IP/Port/URL) →天然全局唯一,直接 HIGH
+        # version/path/hostname →允许多版本共存,需 cs≥0.85 才升 HIGH
+        # NOTE: 多地址共存(如负载均衡+直连)是极低概率事件,当前按 HIGH 处理是安全取舍
         def _is_config_conflict(text_a, text_b):
             triples_a = _extract_entities_and_values(text_a)
             triples_b = _extract_entities_and_values(text_b)
@@ -360,23 +376,54 @@ class Mem0MemoryProvider(MemoryProvider):
                 for key in set(map_a.keys()) & set(map_b.keys()):
                     entity, vtype = key
                     if vtype in _EXCLUSIVE_KEYS and map_a[key] != map_b[key]:
-                        return True
-            ip_a = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text_a)
-            ip_b = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', text_b)
+                        etype = 'endpoint' if vtype in ('ip', 'host', 'hostname', 'address', 'url', 'endpoint', 'port') else vtype
+                        return True, etype, f'{vtype} mismatch: {map_a[key]} vs {map_b[key]}'
+            ip_a = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', text_a)
+            ip_b = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', text_b)
             if ip_a and ip_b and set(ip_a) != set(ip_b):
-                return True
+                return True, 'endpoint', f'IP mismatch'
             port_a = re.findall(r'\bport\s*(\d+)\b', text_a, re.I)
             port_b = re.findall(r'\bport\s*(\d+)\b', text_b, re.I)
             if port_a and port_b and set(port_a) != set(port_b):
-                return True
+                return True, 'endpoint', f'Port mismatch'
             ver_a = re.findall(r'(?:v|version\s*)?(\d+\.\d+(?:\.\d+)?)', text_a, re.I)
             ver_b = re.findall(r'(?:v|version\s*)?(\d+\.\d+(?:\.\d+)?)', text_b, re.I)
             if ver_a and ver_b and set(ver_a) != set(ver_b):
-                return True
-            return False
+                return True, 'version', f'Version mismatch'
+            url_a = re.findall(r'https?://\S+', text_a)
+            url_b = re.findall(r'https?://\S+', text_b)
+            if url_a and url_b and set(url_a) != set(url_b):
+                return True, 'endpoint', f'URL mismatch'
+            return False, '', ''
 
         if has_vectors:
-            for mem in results:
+            # --- Phase 1: Hash pre-scan (O(N) exact dedup) ---
+            # Normalize text → MD5 hash. If hash collides, mark as shadow.
+            # DeepSeek suggestion: if shadow is newer, backfill updated_at to retained entry.
+            hash_map = {}  # hash → (mem, index_in_results)
+            for idx, mem in enumerate(results):
+                h = _text_hash(mem.get('memory', ''))
+                mem_id = mem.get('id', '')
+                if h in hash_map:
+                    existing_mem, _ = hash_map[h]
+                    shadow_ids.append(mem_id)
+                    # Timestamp backfill: if shadow is newer, update retained entry
+                    try:
+                        shadow_ts = mem.get('updated_at', '')
+                        existing_ts = existing_mem.get('updated_at', '')
+                        if shadow_ts and existing_ts and shadow_ts > existing_ts:
+                            existing_mem['updated_at'] = shadow_ts
+                            logger.info("[DEDUP] Hash shadow backfilled updated_at: %s → %s",
+                                       existing_ts[:19], shadow_ts[:19])
+                    except Exception:
+                        pass
+                else:
+                    hash_map[h] = (mem, idx)
+
+            # Process only non-shadowed memories
+            unique_results = [mem for mem, _ in hash_map.values()]
+
+            for mem in unique_results:
                 mem_id = mem.get('id', '')
                 mem_text = mem.get('memory', '')
                 mem_vec = mem.get('_embedding')
@@ -393,34 +440,35 @@ class Mem0MemoryProvider(MemoryProvider):
                     else:
                         continue
 
-                    logger.info("SIM: %.3f vs thresholds (0.97/0.92/0.75)", cos_sim)
+                    logger.info("SIM: %.3f vs thresholds (0.92/0.75)", cos_sim)
 
-                    if cos_sim > 0.97:
-                        if is_exact_duplicate(mem_text, kept_mem.get('memory', '')):
-                            shadow_ids.append(mem_id)
-                            is_duplicate = True
-                            break
-                        else:
-                            if cos_sim > max_sim:
-                                conflict_with = kept_mem
-                                max_sim = cos_sim
-                                conflict_level = 'high'
-                    elif cos_sim > 0.92 and cos_sim > max_sim:
+                    # Tier 1: cos_sim > 0.92 → high-confidence conflict
+                    if cos_sim > 0.92 and cos_sim > max_sim:
                         conflict_with = kept_mem
                         max_sim = cos_sim
                         conflict_level = 'high'
+                    # Tier 2: cos_sim > 0.75 → check config conflict for promotion
                     elif cos_sim > 0.75 and cos_sim > max_sim:
-                        is_cc = _is_config_conflict(mem_text, kept_mem.get('memory', ''))
-                        logger.info("Conflict check: sim=%.3f, config_conflict=%s -> level=%s",
-                                   cos_sim, is_cc, 'high' if is_cc else 'medium')
+                        is_cc, entity_type, reason = _is_config_conflict(mem_text, kept_mem.get('memory', ''))
+                        logger.info("Conflict check: sim=%.3f, entity_type=%s, reason=%s",
+                                   cos_sim, entity_type, reason)
                         if is_cc:
-                            conflict_with = kept_mem
-                            max_sim = cos_sim
-                            conflict_level = 'high'
+                            # Entity type tiering: endpoint → always HIGH; version/path → needs cs≥0.85
+                            if entity_type == 'endpoint':
+                                conflict_level = 'high'
+                            elif entity_type in ('version', 'path', 'hostname'):
+                                if cos_sim >= 0.85:
+                                    conflict_level = 'high'
+                                else:
+                                    conflict_level = 'medium'
+                            else:
+                                conflict_level = 'medium'
                         else:
+                            conflict_level = 'medium'
+
+                        if conflict_level == 'high' or (cos_sim > max_sim and conflict_with is None):
                             conflict_with = kept_mem
                             max_sim = cos_sim
-                            conflict_level = 'medium'
 
                 if not is_duplicate:
                     kept.append(mem)
@@ -609,8 +657,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 
                 # Get paths from config (with local defaults)
                 cfg = _load_config()
-                MEM0_SERVER = cfg.get("mem0_server", "/opt/mem0/mem0_server.py")
-                MEM0_PYTHON = cfg.get("mem0_python", "/opt/mem0/.venv/bin/python")
+                MEM0_SERVER = cfg.get("mem0_server", "")  # set via MEM0_SERVER env or mem0.json
+                MEM0_PYTHON = cfg.get("mem0_python", "")  # set via MEM0_PYTHON env or mem0.json
 
                 def run_with_retry(cmd, timeout=30, max_retries=3):
                     """Run subprocess with exponential backoff retry."""
@@ -652,8 +700,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
                 # Apply shared deduplication + conflict detection + track freezing
                 cfg = _load_config()
-                MEM0_SERVER = cfg.get("mem0_server", "/opt/mem0/mem0_server.py")
-                MEM0_PYTHON = cfg.get("mem0_python", "/opt/mem0/.venv/bin/python")
+                MEM0_SERVER = cfg.get("mem0_server", "")  # set via MEM0_SERVER env or mem0.json
+                MEM0_PYTHON = cfg.get("mem0_python", "")  # set via MEM0_PYTHON env or mem0.json
 
                 top_k_inject = 5
                 lines, kept_ids, shadow_ids = self._advanced_dedup_and_format(
@@ -737,8 +785,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 
                 # Get paths from config (with local defaults)
                 cfg = _load_config()
-                MEM0_SERVER = cfg.get("mem0_server", "/opt/mem0/mem0_server.py")
-                MEM0_PYTHON = cfg.get("mem0_python", "/opt/mem0/.venv/bin/python")
+                MEM0_SERVER = cfg.get("mem0_server", "")  # set via MEM0_SERVER env or mem0.json
+                MEM0_PYTHON = cfg.get("mem0_python", "")  # set via MEM0_PYTHON env or mem0.json
 
                 result = subprocess.run(
                     [

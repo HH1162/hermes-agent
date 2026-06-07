@@ -141,7 +141,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
     def is_available(self) -> bool:
         cfg = _load_config()
-        return bool(cfg.get("api_key"))
+        # Support both platform mode (api_key) and local mode
+        return bool(cfg.get("api_key")) or cfg.get("mode") == "local"
 
     def save_config(self, values, hermes_home):
         """Write config to $HERMES_HOME/mem0.json."""
@@ -172,8 +173,43 @@ class Mem0MemoryProvider(MemoryProvider):
             if self._client is not None:
                 return self._client
             try:
-                from mem0 import MemoryClient
-                self._client = MemoryClient(api_key=self._api_key)
+                cfg = _load_config()
+                if cfg.get("mode") == "local":
+                    # Local mode: use Memory.from_config()
+                    # ⚡ Force offline mode — prevent transformers/hf_hub from downloading
+                    # config files every time the model loads. Model files are already local.
+                    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+                    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                    from mem0 import Memory
+                    self._client = Memory.from_config({
+                        'llm': {
+                            'provider': 'openai',
+                            'config': {
+                                'api_key': 'local',
+                                'openai_base_url': cfg.get("llm_base_url", "http://localhost:1234/v1"),
+                                'model': cfg.get("llm_model", "qwen3")
+                            }
+                        },
+                        'embedder': {
+                            'provider': 'huggingface',
+                            'config': {
+                                'model': cfg.get("embedder_model", "/home/herocco/bge/bge-large-zh-v1.5")
+                            }
+                        },
+                        'vector_store': {
+                            'provider': 'qdrant',
+                            'config': {
+                                'collection_name': 'mem0',
+                                'embedding_model_dims': cfg.get("embedding_dims", 1024),
+                                'host': cfg.get("qdrant_host", "localhost"),
+                                'port': cfg.get("qdrant_port", 6333)
+                            }
+                        },
+                    })
+                else:
+                    # Platform mode: use MemoryClient with API key
+                    from mem0 import MemoryClient
+                    self._client = MemoryClient(api_key=self._api_key)
                 return self._client
             except ImportError:
                 raise RuntimeError("mem0 package not installed. Run: pip install mem0ai")

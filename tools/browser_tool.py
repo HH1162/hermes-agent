@@ -109,6 +109,29 @@ try:
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
 
+# CloakBrowser local anti-detection browser backend (optional).
+# When browser.cloud_provider is set to 'cloak', all browser operations
+# route through the CloakBridge daemon WebSocket RPC instead of the agent-browser CLI.
+
+
+def _is_cloak_mode() -> bool:
+    """True when CloakBrowser backend is configured and active."""
+    import logging as _log
+    _logger = _log.getLogger(__name__)
+    # NOTE: Do NOT cache — provider may be lazy-loaded after first call
+    try:
+        provider = _get_cloud_provider()
+        name = getattr(provider, "name", "")
+        _logger.info("CLOAK_CHECK: provider=%s name=%s type=%s", provider, name, type(provider).__name__)
+        if provider and name == "cloak":
+            _logger.info("CLOAK_MODE: ENABLED")
+            return True
+    except Exception as e:
+        _logger.info("CLOAK_CHECK: exception=%s", e)
+        pass
+    _logger.info("CLOAK_MODE: DISABLED")
+    return False
+
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
@@ -2360,6 +2383,12 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_navigate
         return camofox_navigate(url, task_id)
 
+    # Cloak backend — delegate to RPC path (bypass agent-browser CLI)
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_navigate
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_navigate(url, effective_task_id)
+
     if auto_local_this_nav:
         logger.info(
             "browser_navigate: auto-routing %s to local Chromium sidecar "
@@ -2506,6 +2535,11 @@ def browser_snapshot(
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
 
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_snapshot
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_snapshot(full, effective_task_id)
+
     effective_task_id = _last_session_key(task_id or "default")
 
     # Build command args based on full flag
@@ -2570,6 +2604,11 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
 
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_click
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_click(ref, effective_task_id)
+
     effective_task_id = _last_session_key(task_id or "default")
 
     # Ensure ref starts with @
@@ -2607,6 +2646,11 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
+
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_type
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_type(ref, text, effective_task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
 
@@ -2666,6 +2710,10 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
 
     effective_task_id = _last_session_key(task_id or "default")
 
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_scroll
+        return cloak_scroll(direction, effective_task_id)
+
     result = _run_browser_command(effective_task_id, "scroll", [direction, str(_SCROLL_PIXELS)])
     if not result.get("success"):
         response = {
@@ -2694,6 +2742,11 @@ def browser_back(task_id: Optional[str] = None) -> str:
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
+
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_back
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_back(effective_task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
     result = _run_browser_command(effective_task_id, "back", [])
@@ -2727,6 +2780,11 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
+
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_press
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_press(key, effective_task_id)
 
     effective_task_id = _last_session_key(task_id or "default")
     result = _run_browser_command(effective_task_id, "press", [key])
@@ -2763,15 +2821,21 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     Returns:
         JSON string with console messages/errors, or eval result
     """
+    # --- Route to backend providers first ---
+    if _is_camofox_mode():
+        from tools.browser_camofox import camofox_console
+        return camofox_console(clear, task_id)
+
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_console
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_console(expression, clear, effective_task_id)
+
     # --- JS evaluation mode ---
     if expression is not None:
         return _browser_eval(expression, task_id)
 
     # --- Console output mode (original behaviour) ---
-    if _is_camofox_mode():
-        from tools.browser_camofox import camofox_console
-        return camofox_console(clear, task_id)
-
     effective_task_id = _last_session_key(task_id or "default")
 
     console_args = ["--clear"] if clear else []
@@ -3013,6 +3077,11 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
         from tools.browser_camofox import camofox_get_images
         return camofox_get_images(task_id)
 
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_get_images
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_get_images(effective_task_id)
+
     effective_task_id = _last_session_key(task_id or "default")
 
     # Use eval to run JavaScript that extracts images
@@ -3086,6 +3155,11 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
         return camofox_vision(question, annotate, task_id)
+
+    if _is_cloak_mode():
+        from tools.browser_cloak import cloak_vision
+        effective_task_id = _last_session_key(task_id or "default")
+        return cloak_vision(question, annotate, effective_task_id)
 
     import base64
     import uuid as uuid_mod
@@ -3201,10 +3275,57 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                 ),
             }, ensure_ascii=False)
 
-        # Convert screenshot to base64 at full resolution.
+        # ★ Compress screenshot BEFORE base64 encoding — reduces token cost by ~50%.
+        # Vision model token usage scales with pixel count. A 1920x947 PNG has ~1.8M pixels
+        # (~50-100K tokens). Resizing to 1280px wide + JPEG q=80 cuts this to ~0.6M pixels
+        # (~20-30K tokens) with negligible visual quality loss for LLM analysis.
         _screenshot_bytes = screenshot_path.read_bytes()
+        _compressed_path = None
+        try:
+            from PIL import Image
+            import io as _io_compress
+
+            with Image.open(screenshot_path) as img:
+                # Resize: cap width at 1280, preserve aspect ratio
+                orig_w, orig_h = img.size
+                if orig_w > 1280:
+                    ratio = 1280 / orig_w
+                    img = img.resize((1280, int(orig_h * ratio)), Image.LANCZOS)
+
+                # Convert to JPEG with quality 80 — much smaller than PNG for screenshots
+                # Handle RGBA/P modes that JPEG doesn't support
+                if img.mode in ("RGBA", "P"):
+                    bg = Image.new("RGB", img.size, (255, 255, 255))
+                    if img.mode == "P":
+                        img = img.convert("RGBA")
+                    bg.paste(img, mask=img.split()[3])
+                    img = bg
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+
+                buf = _io_compress.BytesIO()
+                img.save(buf, format="JPEG", quality=80, optimize=True)
+                compressed_bytes = buf.getvalue()
+
+                # Only use compressed version if it's actually smaller
+                if len(compressed_bytes) < len(_screenshot_bytes):
+                    _compressed_path = screenshot_path.with_suffix(".jpg")
+                    _compressed_path.write_bytes(compressed_bytes)
+                    logger.info(
+                        "browser_vision: compressed screenshot %d→%d bytes (%.0f%% reduction, %dx%d)",
+                        len(_screenshot_bytes), len(compressed_bytes),
+                        (1 - len(compressed_bytes) / len(_screenshot_bytes)) * 100,
+                        img.width if hasattr(img, 'width') else img.size[0],
+                        img.height if hasattr(img, 'height') else img.size[1],
+                    )
+        except Exception as _compress_err:
+            logger.debug("browser_vision: compression skipped (%s)", _compress_err)
+
+        # Use compressed path if available
+        _vision_screenshot_path = _compressed_path or screenshot_path
+        _screenshot_bytes = _vision_screenshot_path.read_bytes()
         _screenshot_b64 = base64.b64encode(_screenshot_bytes).decode("ascii")
-        data_url = f"data:image/png;base64,{_screenshot_b64}"
+        data_url = f"data:image/jpeg;base64,{_screenshot_b64}"
 
         # Fast path: when native image routing is in effect for the active main
         # model, attach the screenshot directly instead of describing it through

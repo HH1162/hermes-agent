@@ -268,6 +268,21 @@ HARDLINE_PATTERNS = [
     (_CMDPOS + r'init\s+[06]\b', "init 0/6 (shutdown/reboot)"),
     (_CMDPOS + r'systemctl\s+(poweroff|reboot|halt|kexec)\b', "systemctl poweroff/reboot"),
     (_CMDPOS + r'telinit\s+[06]\b', "telinit 0/6 (shutdown/reboot)"),
+    # Gateway lifecycle protection: prevent the agent from killing its own
+    # gateway process via systemctl.  `systemctl stop/restart hermes-gateway`
+    # triggers SIGTERM on the gateway process — the running agent cannot
+    # recover after its own host is killed, and the systemd exit flow
+    # (signal-initiated shutdown without restart request → exit 1) will
+    # NOT be revived by systemd because it is treated as an intentional stop.
+    # This is the unconditional block — there is never a legitimate reason
+    # for the agent to stop/restart its own gateway via systemctl.
+    # Use /restart (WeChat command) or `hermes gateway restart` instead,
+    # which go through the proper restart flow (exit 75 → systemd revival).
+    (_CMDPOS + r'systemctl\s+(-[^\s]+\s+)*(stop|restart)\s+hermes-gateway', "stop/restart hermes-gateway via systemctl (self-termination, use /restart command instead)"),
+    # User-level systemd — gateway runs as a user service, not system service.
+    # `systemctl --user stop/restart hermes-gateway.service` has the same
+    # self-termination effect and must be blocked unconditionally.
+    (_CMDPOS + r'systemctl\s+--user\s+(-[^\s]+\s+)*(stop|restart)\s+hermes-gateway', "stop/restart hermes-gateway via systemctl --user (self-termination, use /restart command instead)"),
 ]
 
 # Pre-compiled variant used by the hot-path matcher. Building these at module

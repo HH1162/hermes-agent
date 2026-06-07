@@ -18,6 +18,7 @@ from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     extract_skill_conditions,
     extract_skill_description,
+    extract_skill_trigger_words,
     get_all_skills_dirs,
     get_disabled_skill_names,
     iter_skill_index_files,
@@ -302,6 +303,18 @@ TASK_COMPLETION_GUIDANCE = (
     "output (made-up data, invented file contents, synthesised API responses) "
     "for results you couldn't actually produce. Reporting a blocker honestly "
     "is always better than inventing a result."
+)
+
+# Notification handling guidance — tells the LLM how to interpret tagged messages
+# in the conversation, preventing background task notifications from being treated
+# as user intent and ensuring user input takes priority.
+NOTIFICATION_HANDLING_GUIDANCE = (
+    "# Input routing rules\n"
+    "- Messages wrapped in `[SYSTEM NOTIFICATION] ... [END SYSTEM NOTIFICATION]` are "
+    "automated background events (e.g., task completions). DO NOT treat them as user "
+    "questions or conversation topics.\n"
+    "- Messages prefixed with `[USER LATEST INPUT]` are the actual user input. You MUST "
+    "prioritize responding to this above all system notifications.\n"
 )
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
@@ -1018,6 +1031,7 @@ def _build_snapshot_entry(
         "description": description,
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
+        "trigger_words": extract_skill_trigger_words(frontmatter),
     }
 
 
@@ -1080,6 +1094,35 @@ def _skill_should_show(
             return False
 
     return True
+
+
+def _get_skills_index_mode() -> str:
+    """Read skills.index_mode from config.yaml.
+
+    Returns one of:
+      - "full" (default): inject all skill names + descriptions into system prompt
+      - "category": only inject category names + counts, use skills_list() on demand
+      - "silent": inject nothing, rely entirely on skills_list() tool
+    """
+    from hermes_constants import get_config_path
+    from agent.skill_utils import yaml_load
+
+    config_path = get_config_path()
+    if not config_path.exists():
+        return "full"
+    try:
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+        if not isinstance(parsed, dict):
+            return "full"
+        skills_cfg = parsed.get("skills")
+        if not isinstance(skills_cfg, dict):
+            return "full"
+        mode = skills_cfg.get("index_mode", "full")
+        if mode in ("full", "category", "silent"):
+            return mode
+        return "full"
+    except Exception:
+        return "full"
 
 
 def build_skills_system_prompt(
@@ -1259,52 +1302,105 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
+        index_mode = _get_skills_index_mode()
         index_lines = []
-        for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
-            seen = set()
-            for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
-                if name in seen:
-                    continue
-                seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+        if index_mode == "silent":
+            # Silent mode: no skill index in system prompt, rely on skills_list() tool
+            result = (
+                "## Skills\n"
+                "A skills catalog is available — call skills_list() when you think a specialized "
+                "skill might help.  Use skills_list(category='...') to browse a category, or "
+                "skills_list(query='关键词') to search by keyword.  Then load the matching skill "
+                "with skill_view(name).\n"
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows.\n"
+                "\n"
+                "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+                "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+                "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+                "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+                "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill."
+            )
+        elif index_mode == "category":
+            # Category mode: only show category names + counts (saves ~95% of index tokens)
+            for category in sorted(skills_by_category.keys()):
+                cat_desc = category_descriptions.get(category, "")
+                count = len(skills_by_category[category])
+                if cat_desc:
+                    index_lines.append(f"  {category} ({count} skills): {cat_desc}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"  {category} ({count} skills)")
 
-        result = (
-            "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
-            "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
-            "`hermes setup`) so you don't have to guess or invent workarounds.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
-            "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
-            "\n"
-            "Only proceed without loading a skill if genuinely none are relevant to the task."
-        )
+            result = (
+                "## Skills (mandatory)\n"
+                "Skills organized by category. To find relevant skills:\n"
+                "  1. Call skills_list(query='关键词') to search across all skills by keyword\n"
+                "  2. Call skills_list(category='xxx') to browse a specific category\n"
+                "  3. Call skill_view(name) to load the skill content\n"
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows.\n"
+                "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+                "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+                "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+                "first.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill.\n"
+                "\n"
+                "<available_skills>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skills>\n"
+                "\n"
+                "Only proceed without loading a skill if genuinely none are relevant to the task."
+            )
+        else:
+            # Full mode (default): inject all skill names + descriptions
+            for category in sorted(skills_by_category.keys()):
+                cat_desc = category_descriptions.get(category, "")
+                if cat_desc:
+                    index_lines.append(f"  {category}: {cat_desc}")
+                else:
+                    index_lines.append(f"  {category}:")
+                # Deduplicate and sort skills within each category
+                seen = set()
+                for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    if desc:
+                        index_lines.append(f"    - {name}: {desc}")
+                    else:
+                        index_lines.append(f"    - {name}")
+
+            result = (
+                "## Skills (mandatory)\n"
+                "Before replying, scan the skills below. If a skill matches or is even partially relevant "
+                "to your task, you MUST load it with skill_view(name) and follow its instructions. "
+                "Err on the side of loading — it is always better to have context you don't need "
+                "than to miss critical steps, pitfalls, or established workflows. "
+                "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
+                "and proven workflows that outperform general-purpose approaches. Load the skill "
+                "even if you think you could handle the task with basic tools like web_search or terminal. "
+                "Skills also encode the user's preferred approach, conventions, and quality standards "
+                "for tasks like code review, planning, and testing — load them even for tasks you "
+                "already know how to do, because the skill defines how it should be done here.\n"
+                "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
+                "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+                "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+                "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
+                "`hermes setup`) so you don't have to guess or invent workarounds.\n"
+                "If a skill has issues, fix it with skill_manage(action='patch').\n"
+                "After difficult/iterative tasks, offer to save as a skill. "
+                "If a skill you loaded was missing steps, had wrong commands, or needed "
+                "pitfalls you discovered, update it before finishing.\n"
+                "\n"
+                "<available_skills>\n"
+                + "\n".join(index_lines) + "\n"
+                "</available_skills>\n"
+                "\n"
+                "Only proceed without loading a skill if genuinely none are relevant to the task."
+            )
 
     # ── Store in LRU cache ────────────────────────────────────────────
     with _SKILLS_PROMPT_CACHE_LOCK:

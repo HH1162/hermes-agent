@@ -838,6 +838,7 @@ Do NOT use sed/awk to edit files — use patch instead.
 Do NOT use echo/cat heredoc to create files — use write_file instead.
 Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 
+⚠️ CRITICAL: Any command expected to take >30 seconds (downloads, installs, builds, batch processing) MUST use background=true + notify_on_complete=true. Foreground execution blocks the entire agent loop — you cannot respond to user messages, and interrupt mode does NOT apply during tool calls. This is not optional.
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
 Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
   (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.

@@ -32,6 +32,7 @@ from agent.prompt_builder import (
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
+    NOTIFICATION_HANDLING_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
@@ -110,6 +111,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
+
+    # Input routing rules: how to interpret tagged messages in conversation history.
+    stable_parts.append(NOTIFICATION_HANDLING_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

@@ -377,6 +377,14 @@ class GatewayStreamConsumer:
                     self._in_think_block = True
                     buf = buf[best_idx + best_len:]
                 else:
+                    # 🛡️ Defensive: strip orphan close tags that leaked from
+                    # upstream (e.g. when think_scrubber fell back to
+                    # per-delta regex — see #17924).  Without this,
+                    # </think> would accumulate and be sent to the user.
+                    for tag in self._CLOSE_THINK_TAGS:
+                        buf = buf.replace(tag, "")
+                    if not buf:
+                        return
                     # No opening tag — check for a partial tag at the tail
                     held_back = 0
                     for tag in self._OPEN_THINK_TAGS:

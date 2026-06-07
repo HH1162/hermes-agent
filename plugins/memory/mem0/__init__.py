@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from typing import Any, Dict, List
@@ -268,7 +269,19 @@ class Mem0MemoryProvider(MemoryProvider):
             "# Mem0 Memory\n"
             f"Active. User: {self._user_id}.\n"
             "Use mem0_search to find memories, mem0_conclude to store facts, "
-            "mem0_profile for a full overview."
+            "mem0_profile for a full overview.\n"
+            "\n"
+            "## Memory Format\n"
+            "Each memory has a prefix: `[Updated N days ago | YYYY-MM-DD | 高频/中频/低频]`\n"
+            "- 高频 (>20次访问): 重要事实，优先信任\n"
+            "- 中频 (5-20次): 常规信息\n"
+            "- 低频 (<5次): 可能已过时\n"
+            "Conflicts are marked: `⚠️ 可能与第N条冲突(相似度X.XX)`\n"
+            "\n"
+            "## Conflict Resolution Rules (when conflicting memories appear)\n"
+            "1. **时效优先**: 选择更新时间较近的记忆（Updated N days ago 较小）\n"
+            "2. **频次优先** (时间差 < 3天): 选择访问频次较高的记忆（高频 > 中频 > 低频）\n"
+            "3. **冲突确认** (权重相当时): 不要自行决定丢弃任何一方，在回复中委婉提及两种可能性"
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -287,17 +300,191 @@ class Mem0MemoryProvider(MemoryProvider):
 
         def _run():
             try:
-                client = self._get_client()
-                results = self._unwrap_results(client.search(
-                    query=query,
-                    filters=self._read_filters(),
-                    rerank=self._rerank,
-                    top_k=5,
-                ))
-                if results:
-                    lines = [r.get("memory", "") for r in results if r.get("memory")]
-                    with self._prefetch_lock:
-                        self._prefetch_result = "\n".join(f"- {l}" for l in lines)
+                import subprocess
+                import re
+                
+                # Over-fetching: retrieve top_k=20, deduplicate, then inject top 5
+                # This solves high-frequency memory occupation and improves recall
+                top_k_fetch = 20
+                top_k_inject = 5
+                
+                MEM0_SERVER = "/media/data/mem0/mem0_server.py"
+                MEM0_PYTHON = "/media/data/mem0/.venv/bin/python"
+
+                def run_with_retry(cmd, timeout=30, max_retries=3):
+                    """Run subprocess with exponential backoff retry."""
+                    last_error = None
+                    for attempt in range(max_retries):
+                        try:
+                            result = subprocess.run(
+                                cmd, capture_output=True, text=True, timeout=timeout
+                            )
+                            if result.returncode == 0:
+                                return result
+                            last_error = f"Command failed (attempt {attempt + 1}): {result.stderr}"
+                        except subprocess.TimeoutExpired as e:
+                            last_error = f"Timeout (attempt {attempt + 1}): {e}"
+                        except Exception as e:
+                            last_error = f"Error (attempt {attempt + 1}): {e}"
+
+                        # Exponential backoff: 1s, 2s, 4s
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)
+
+                    raise RuntimeError(last_error)
+
+                # Step 1: Search with --no-track (decouple search from tracking)
+                result = run_with_retry(
+                    [
+                        MEM0_PYTHON, MEM0_SERVER,
+                        "search", query, self._user_id, str(top_k_fetch),
+                        "true" if self._rerank else "false", "--no-track"
+                    ],
+                    timeout=30
+                )
+                
+                data = json.loads(result.stdout)
+                results = self._unwrap_results(data)
+                
+                if not results:
+                    return
+                
+                # Step 2: Dual-threshold deduplication (keep Qdrant original order)
+                # - cosine > 0.95 + exact text match: discard (pure redundant), add to shadow_ids
+                # - cosine > 0.95 + text differs: downgrade to conflict retention
+                # - 0.85 < cosine <= 0.95: retain + mark conflict
+                # - cosine <= 0.85: normal injection
+                
+                # Use text-based similarity (faster than embeddings, no extra deps)
+                from difflib import SequenceMatcher
+                
+                def text_similarity(text1, text2):
+                    """Compute text similarity using SequenceMatcher (0-1 scale)."""
+                    if not text1 or not text2:
+                        return 0.0
+                    return SequenceMatcher(None, text1.lower(), text2.lower()).ratio()
+                
+                def is_exact_duplicate(text1, text2):
+                    """Check if texts are identical after removing punctuation and spaces."""
+                    clean1 = re.sub(r'[^\w\s]', '', text1).strip()
+                    clean2 = re.sub(r'[^\w\s]', '', text2).strip()
+                    return clean1 == clean2
+                
+                kept = []           # Memories to inject
+                shadow_ids = []     # Pure redundant memories (for touch only)
+                conflicts = []      # Conflict pairs: (mem, conflict_with_mem, similarity)
+                
+                # Keep Qdrant original order (similarity from high to low)
+                for mem in results:
+                    mem_id = mem.get('id', '')
+                    mem_text = mem.get('memory', '')
+                    
+                    is_duplicate = False
+                    conflict_with = None
+                    max_sim = 0.0
+                    
+                    for kept_mem in kept:
+                        cos_sim = text_similarity(mem_text, kept_mem.get('memory', ''))
+                        
+                        if cos_sim > 0.95:
+                            if is_exact_duplicate(mem_text, kept_mem.get('memory', '')):
+                                shadow_ids.append(mem_id)
+                                is_duplicate = True
+                                break
+                            else:
+                                # Text differs, downgrade to conflict retention
+                                if cos_sim > max_sim:
+                                    conflict_with = kept_mem
+                                    max_sim = cos_sim
+                        elif cos_sim > 0.85 and cos_sim > max_sim:
+                            conflict_with = kept_mem
+                            max_sim = cos_sim
+                    
+                    if not is_duplicate:
+                        kept.append(mem)
+                        if conflict_with is not None:
+                            conflicts.append((mem, conflict_with, max_sim))
+                
+                # Step 3: Track inject_ids and touch shadow_ids
+                if kept or shadow_ids:
+                    # Track inject_ids (full track: update last_accessed_at + increment access_count)
+                    inject_ids = [m.get('id', '') for m in kept]
+                    if inject_ids:
+                        run_with_retry(
+                            [
+                                MEM0_PYTHON, MEM0_SERVER,
+                                "track", json.dumps(inject_ids)
+                            ],
+                            timeout=10
+                        )
+                    
+                    # Touch shadow_ids (touch only: update last_accessed_at, no access_count change)
+                    if shadow_ids:
+                        run_with_retry(
+                            [
+                                MEM0_PYTHON, MEM0_SERVER,
+                                "touch", json.dumps(shadow_ids)
+                            ],
+                            timeout=10
+                        )
+                
+                # Step 4: Format memories with frequency labels and conflict markers
+                from datetime import datetime, timezone
+                
+                def get_frequency_label(access_count):
+                    if access_count > 20:
+                        return "高频"
+                    elif access_count >= 5:
+                        return "中频"
+                    else:
+                        return "低频"
+                
+                def format_memory(mem, conflict_info=None):
+                    now = datetime.now(timezone.utc)
+                    updated_str = mem.get('updated_at', '')
+                    days_ago = 0
+                    if updated_str:
+                        try:
+                            updated = datetime.fromisoformat(updated_str.replace('Z', '+00:00'))
+                            if updated.tzinfo is None:
+                                updated = updated.replace(tzinfo=timezone.utc)
+                            days_ago = max(0, (now - updated).days)
+                        except Exception:
+                            pass
+                    
+                    # Access count is in metadata field
+                    metadata = mem.get('metadata', {}) or {}
+                    access_count = metadata.get('access_count', 0)
+                    freq = get_frequency_label(access_count)
+                    
+                    prefix = f"[Updated {days_ago} days ago | {datetime.now(timezone.utc).strftime('%Y-%m-%d')} | {freq}]"
+                    
+                    if conflict_info:
+                        target_index, sim = conflict_info
+                        note = f" ⚠️ 可能与第{target_index}条冲突(相似度{sim:.2f})"
+                        return f"- {prefix}{note}：{mem.get('memory', '')}"
+                    else:
+                        return f"- {prefix} {mem.get('memory', '')}"
+                
+                # Build final output (top 5 after deduplication)
+                final_kept = kept[:top_k_inject]
+                lines = []
+                for i, mem in enumerate(final_kept):
+                    # Check if this memory has a conflict
+                    conflict_info = None
+                    for c_mem, c_with, c_sim in conflicts:
+                        if c_mem.get('id') == mem.get('id'):
+                            # Find the index of the conflict target
+                            for j, k_mem in enumerate(final_kept):
+                                if k_mem.get('id') == c_with.get('id'):
+                                    conflict_info = (j + 1, c_sim)
+                                    break
+                    
+                    lines.append(format_memory(mem, conflict_info))
+                
+                with self._prefetch_lock:
+                    self._prefetch_result = "\n".join(lines)
+                
                 self._record_success()
             except Exception as e:
                 self._record_failure()

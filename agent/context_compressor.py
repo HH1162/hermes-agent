@@ -715,7 +715,15 @@ class ContextCompressor(ContextEngine):
 
         baseline = self.last_rough_tokens_when_real_prompt_fit or self.last_compression_rough_tokens
         if baseline <= 0:
-            return False
+            # No rough baseline yet (e.g. agent was rebuilt).  If we are only
+            # modestly over the threshold, defer once to let the real provider
+            # call establish a proper baseline — prevents repeated compaction
+            # loops right after agent rebuild.
+            tolerated_over_threshold = max(8192, int(self.threshold_tokens * 0.10))
+            if rough_tokens > self.threshold_tokens + tolerated_over_threshold:
+                return False  # Far above threshold — compress as normal
+            self.last_rough_tokens_when_real_prompt_fit = max(self.threshold_tokens, rough_tokens)
+            return True
 
         growth = max(0, rough_tokens - baseline)
         tolerated_growth = max(4096, int(self.threshold_tokens * 0.05))

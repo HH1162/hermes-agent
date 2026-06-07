@@ -767,6 +767,74 @@ def _collect_auto_append_media_tags(
     return media_tags, has_voice_directive
 
 # ---------------------------------------------------------------------------
+# Compression calibration helpers — persist compressor state across agent
+# rebuilds so repeated compaction loops don't fire after evictions.
+# ---------------------------------------------------------------------------
+
+_COMPRESSION_CALIBRATION_FIELDS = (
+    "last_prompt_tokens",
+    "last_real_prompt_tokens",
+    "last_compression_rough_tokens",
+    "last_rough_tokens_when_real_prompt_fit",
+)
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        ivalue = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, ivalue)
+
+
+def _calibration_source_value(source: Any, field: str) -> Any:
+    if isinstance(source, dict):
+        return source.get(field, 0)
+    return getattr(source, field, 0)
+
+
+def _compression_calibration_from_session_entry(session_entry: Any) -> Dict[str, int]:
+    if session_entry is None:
+        return {}
+    return {
+        field: _nonnegative_int(_calibration_source_value(session_entry, field))
+        for field in _COMPRESSION_CALIBRATION_FIELDS
+    }
+
+
+def _hydrate_gateway_compression_calibration(agent: Any, calibration_source: Any) -> None:
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None or calibration_source is None:
+        return
+
+    for field in _COMPRESSION_CALIBRATION_FIELDS:
+        value = _nonnegative_int(_calibration_source_value(calibration_source, field))
+        if value > 0:
+            setattr(compressor, field, value)
+
+    # Backward compatibility for sessions created before the explicit
+    # calibration fields existed: below-threshold last_prompt_tokens came from
+    # a successful provider call often enough to be useful as a conservative
+    # "real prompt fit" signal. Above-threshold values still won't defer.
+    if _nonnegative_int(getattr(compressor, "last_real_prompt_tokens", 0)) <= 0:
+        last_prompt = _nonnegative_int(
+            _calibration_source_value(calibration_source, "last_prompt_tokens")
+        )
+        if last_prompt > 0:
+            compressor.last_real_prompt_tokens = last_prompt
+
+
+def _compression_calibration_from_agent(agent: Any) -> Dict[str, int]:
+    compressor = getattr(agent, "context_compressor", None)
+    if compressor is None:
+        return {}
+    return {
+        field: _nonnegative_int(getattr(compressor, field, 0))
+        for field in _COMPRESSION_CALIBRATION_FIELDS
+    }
+
+
+# ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
 # ---------------------------------------------------------------------------
@@ -8350,10 +8418,9 @@ class GatewayRunner:
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
-        if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
-
         # User-defined quick commands (bypass agent loop, no LLM call)
+        # MUST be checked BEFORE _draining so ops commands (cleanup, restart)
+        # still execute even when gateway is shutting down or draining.
         if command:
             if isinstance(self.config, dict):
                 quick_commands = self.config.get("quick_commands", {}) or {}
@@ -8404,6 +8471,9 @@ class GatewayRunner:
                         return f"Quick command '/{command}' has no target defined."
                 else:
                     return f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias')."
+
+        if self._draining:
+            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
         # Plugin-registered slash commands
         if command:
@@ -9289,7 +9359,6 @@ class GatewayRunner:
                                     model=_hyg_model,
                                     max_iterations=4,
                                     quiet_mode=True,
-                                    skip_memory=True,
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
                                 )
@@ -9323,6 +9392,10 @@ class GatewayRunner:
                                     )
                                     # Reset stored token count — transcript was rewritten
                                     session_entry.last_prompt_tokens = 0
+                                    session_entry.last_real_prompt_tokens = 0
+                                    session_entry.last_compression_rough_tokens = 0
+                                    session_entry.last_rough_tokens_when_real_prompt_fit = 0
+                                    self.session_store._save()
                                     history = _compressed
                                     _new_count = len(_compressed)
                                     _new_tokens = estimate_messages_tokens_rough(
@@ -9503,6 +9576,9 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                compression_calibration=_compression_calibration_from_session_entry(
+                    session_entry
+                ),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -9839,6 +9915,11 @@ class GatewayRunner:
             self.session_store.update_session(
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
+                last_real_prompt_tokens=agent_result.get("last_real_prompt_tokens", 0),
+                last_compression_rough_tokens=agent_result.get("last_compression_rough_tokens", 0),
+                last_rough_tokens_when_real_prompt_fit=agent_result.get(
+                    "last_rough_tokens_when_real_prompt_fit", 0
+                ),
             )
 
             # Auto voice reply: send TTS audio before the text response
@@ -11568,6 +11649,10 @@ class GatewayRunner:
         self.session_store.rewrite_transcript(session_entry.session_id, truncated)
         # Reset stored token count — transcript was truncated
         session_entry.last_prompt_tokens = 0
+        session_entry.last_real_prompt_tokens = 0
+        session_entry.last_compression_rough_tokens = 0
+        session_entry.last_rough_tokens_when_real_prompt_fit = 0
+        self.session_store._save()
         
         # Re-send by creating a fake text event with the old message
         retry_event = MessageEvent(
@@ -11918,6 +12003,10 @@ class GatewayRunner:
 
         # Reset stored token count — transcript was truncated.
         session_entry.last_prompt_tokens = 0
+        session_entry.last_real_prompt_tokens = 0
+        session_entry.last_compression_rough_tokens = 0
+        session_entry.last_rough_tokens_when_real_prompt_fit = 0
+        self.session_store._save()
         # Evict the cached agent so the next turn rebuilds from the active-only
         # transcript and memory providers refresh their per-session caches.
         try:
@@ -13207,7 +13296,6 @@ class GatewayRunner:
                 model=model,
                 max_iterations=4,
                 quiet_mode=True,
-                skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
             )
@@ -13254,7 +13342,11 @@ class GatewayRunner:
                 self.session_store.rewrite_transcript(new_session_id, compressed)
                 # Reset stored token count — transcript changed, old value is stale
                 self.session_store.update_session(
-                    session_entry.session_key, last_prompt_tokens=0
+                    session_entry.session_key,
+                    last_prompt_tokens=0,
+                    last_real_prompt_tokens=0,
+                    last_compression_rough_tokens=0,
+                    last_rough_tokens_when_real_prompt_fit=0,
                 )
                 new_tokens = estimate_request_tokens_rough(
                     compressed, system_prompt=_sys_prompt, tools=_tools
@@ -16541,6 +16633,14 @@ class GatewayRunner:
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
         agent._api_call_count = 0
+        # Clear per-turn guardrails state so a cached agent doesn't carry
+        # over no_progress counts or pending nudges from the previous turn.
+        if hasattr(agent, "_tool_guardrails"):
+            tg = agent._tool_guardrails
+            tg._no_progress.clear()
+            tg._no_progress_nudge.clear()
+            tg._pending_nudge = None
+            tg._halt_decision = None
 
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents — preserves session tool state.
@@ -17006,6 +17106,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        compression_calibration: Optional[Dict[str, int]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -17961,6 +18062,10 @@ class GatewayRunner:
                         self._enforce_agent_cache_cap()
                 logger.debug("Created new agent for session %s (sig=%s)", session_key, _sig)
 
+            # Restore compression calibration from session so the compressor
+            # doesn't lose its baseline after agent rebuilds.
+            _hydrate_gateway_compression_calibration(agent, compression_calibration)
+
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
@@ -18428,11 +18533,13 @@ class GatewayRunner:
             _output_toks = 0
             _context_length = 0
             _agent = agent_holder[0]
+            _compression_calibration = {}
             if _agent and hasattr(_agent, "context_compressor"):
                 _last_prompt_toks = getattr(_agent.context_compressor, "last_prompt_tokens", 0)
                 _input_toks = getattr(_agent, "session_prompt_tokens", 0)
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
+                _compression_calibration = _compression_calibration_from_agent(_agent)
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
@@ -18451,6 +18558,7 @@ class GatewayRunner:
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
                     "last_prompt_tokens": _last_prompt_toks,
+                    **_compression_calibration,
                     "input_tokens": _input_toks,
                     "output_tokens": _output_toks,
                     "model": _resolved_model,
@@ -18607,6 +18715,7 @@ class GatewayRunner:
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "last_prompt_tokens": _last_prompt_toks,
+                **_compression_calibration,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
                 "model": _resolved_model,

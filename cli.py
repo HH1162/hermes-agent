@@ -12796,28 +12796,54 @@ class HermesCLI:
                 self._voice_speak_response_async(response)
 
 
-            # Re-queue the interrupt message (and any that arrived while we were
-            # processing the first) as the next prompt for process_loop.
+            # Re-queue the interrupt message as the next prompt for process_loop.
             # Only reached when busy_input_mode == "interrupt" (the default).
             # In "queue" mode Enter routes directly to _pending_input so this
             # block is never hit.
-            if pending_message and hasattr(self, '_pending_input'):
-                all_parts = [pending_message]
+            try:
+                user_inputs = []
+                if pending_message and isinstance(pending_message, str):
+                    user_inputs.append(pending_message.strip())
                 while not self._interrupt_queue.empty():
                     try:
                         extra = self._interrupt_queue.get_nowait()
-                        if extra:
-                            all_parts.append(extra)
+                        if isinstance(extra, str) and extra.strip():
+                            user_inputs.append(extra.strip())
                     except queue.Empty:
                         break
-                combined = "\n".join(all_parts)
-                n = len(all_parts)
-                preview = combined[:50] + ("..." if len(combined) > 50 else "")
-                if n > 1:
-                    print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
-                else:
-                    print(f"\n⚡ Sending after interrupt: '{preview}'")
-                self._pending_input.put(combined)
+                if user_inputs and hasattr(self, '_pending_input'):
+                    # Sliding window 1500 chars to prevent token explosion
+                    MAX_CHARS = 1500
+                    selected = []
+                    current_len = 0
+                    for inp in reversed(user_inputs):
+                        if current_len + len(inp) + 2 > MAX_CHARS and selected:
+                            break
+                        selected.insert(0, inp)
+                        current_len += len(inp) + 2
+                    combined = "\n\n".join(selected)
+                    n = len(selected)
+                    preview = combined[:50] + ("..." if len(combined) > 50 else "")
+                    if n > 1:
+                        print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
+                    else:
+                        print(f"\n⚡ Sending after interrupt: '{preview}'")
+                    self._pending_input.put(
+                        f"[USER LATEST INPUT - Priority Response Required]\n{combined}"
+                    )
+            except Exception as e:
+                logger.error("Interrupt re-queue logic failed. Falling back to pending_message only.", exc_info=True)
+                if pending_message and isinstance(pending_message, str) and hasattr(self, '_pending_input'):
+                    MAX_CHARS = 1500
+                    if len(pending_message) > MAX_CHARS:
+                        # Head-Tail strategy: preserve context (head) and final intent (tail)
+                        # to avoid truncated context that confuses the LLM
+                        head = pending_message[:700]
+                        tail = pending_message[-700:]
+                        truncated = f"{head}\n\n[...Fallback Truncated due to error...]\n\n{tail}"
+                    else:
+                        truncated = pending_message
+                    self._pending_input.put(truncated)
 
             # If a /steer was left over (agent finished before another tool
             # batch could absorb it), deliver it as the next user turn.
@@ -15176,11 +15202,20 @@ class HermesCLI:
                             try:
                                 from tools.process_registry import process_registry
                                 for _evt, _synth in process_registry.drain_notifications():
-                                    self._pending_input.put(_synth)
+                                    if isinstance(_synth, str):
+                                        wrapped = (
+                                            "[SYSTEM NOTIFICATION - Background task status]\n"
+                                            f"{_synth}\n"
+                                            "[END SYSTEM NOTIFICATION]\n"
+                                            "(Note: This is an automated system event, not a user message.)"
+                                        )
+                                        self._pending_input.put(wrapped)
+                                    else:
+                                        self._pending_input.put(_synth)
                             except Exception:
                                 pass
-                        continue
-                    
+                            continue
+
                     if not user_input:
                         continue
 
@@ -15304,7 +15339,16 @@ class HermesCLI:
                         try:
                             from tools.process_registry import process_registry
                             for _evt, _synth in process_registry.drain_notifications():
-                                self._pending_input.put(_synth)
+                                if isinstance(_synth, str):
+                                    wrapped = (
+                                        "[SYSTEM NOTIFICATION - Background task status]\n"
+                                        f"{_synth}\n"
+                                        "[END SYSTEM NOTIFICATION]\n"
+                                        "(Note: This is an automated system event, not a user message.)"
+                                    )
+                                    self._pending_input.put(wrapped)
+                                else:
+                                    self._pending_input.put(_synth)
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 

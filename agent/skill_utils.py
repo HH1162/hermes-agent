@@ -454,6 +454,44 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
         "requires_tools": hermes.get("requires_tools", []),
     }
 
+# ── Trigger words extraction ─────────────────────────────────────────────
+
+def extract_skill_trigger_words(frontmatter: Dict[str, Any]) -> List[str]:
+    """Extract trigger words from parsed frontmatter for keyword-based routing.
+
+    Trigger words help the agent discover relevant skills without loading the
+    full skill index.  They are used by ``skills_list(query=...)`` to match
+    user intent to skills.
+
+    Supports two frontmatter formats::
+
+        trigger_words: [python, debug, pdb]
+
+    or::
+
+        trigger_words:
+          - python
+          - debug
+          - pdb
+
+    Returns a de-duplicated, lowercased list of trigger words.
+    """
+    raw = frontmatter.get("trigger_words")
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [w.strip() for w in raw.split(",") if w.strip()]
+    if not isinstance(raw, list):
+        return []
+    seen: set = set()
+    result: list = []
+    for word in raw:
+        w = str(word).strip().lower()
+        if w and w not in seen:
+            seen.add(w)
+            result.append(w)
+    return result
+
 
 # ── Skill config extraction ───────────────────────────────────────────────
 

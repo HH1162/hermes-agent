@@ -109,6 +109,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
         gw.request<PromptSubmitResponse>('prompt.submit', { session_id: sid, text: submitText }).catch((e: Error) => {
           if (isSessionBusyError(e)) {
+            // In interrupt mode, discard older queued messages so the latest
+            // input takes priority — prevents "old command replays" on rapid
+            // interrupt (e.g. user hits Enter 3x during a long turn).
+            composerRefs.queueRef.current = []
             composerActions.enqueue(submitText)
             patchUiState({ busy: true, status: 'queued for next turn' })
 

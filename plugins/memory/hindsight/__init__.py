@@ -47,11 +47,52 @@ from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Monkey-patch: hindsight_embed create_profile() — merge instead of overwrite
+#
+# Problem: _register_profile() calls create_profile() which uses write_text()
+# to OVERWRITE the entire .env file with only HINDSIGHT_API_* keys (5 base
+# keys), losing all other config like LLM_EXTRA_BODY, EMBEDDINGS_*, RERANKER_*.
+#
+# Fix: patch create_profile to read existing .env first, then merge new keys
+# into existing content before writing back. Key set is fixed (~14 keys) so
+# the file never grows unbounded.
+# ---------------------------------------------------------------------------
+try:
+    from hindsight_embed.profile_manager import ProfileManager as _PM
+
+    _original_create_profile = _PM.create_profile
+
+    def _patched_create_profile(self, name, port_or_config, config=None):
+        # Read existing .env to preserve keys not in the incoming config
+        existing = {}
+        if port_or_config is None or not isinstance(port_or_config, dict):
+            existing = _load_simple_env(self._get_profiles_dir() / f"{name}.env")
+        else:
+            existing = _load_simple_env(self._get_profiles_dir() / f"{name}.env")
+
+        # Call original to get its behavior (metadata update, etc.)
+        _original_create_profile(self, name, port_or_config, config)
+
+        # Now read what was written + merge with preserved existing keys
+        config_path = self._get_profiles_dir() / f"{name}.env"
+        if config_path.exists():
+            current = _load_simple_env(config_path)
+            # Merge: existing keys that are NOT in current get added back
+            merged = {**existing, **current}
+            lines = [f"{k}={v}" for k, v in merged.items()]
+            config_path.write_text("\n".join(lines) + "\n")
+
+    _PM.create_profile = _patched_create_profile
+    logger.debug("Monkey-patched ProfileManager.create_profile to preserve .env keys")
+except Exception:
+    pass  # Silently skip if hindsight_embed not installed
+
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.4.22"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
-_DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+_DEFAULT_IDLE_TIMEOUT = 0  # seconds — Hindsight embedded daemon default (0 = never shutdown)
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -426,6 +467,12 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     }
     if current_base_url:
         env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
+    
+    # Extra body params for LLM calls (e.g., reasoning_effort, chat_template_kwargs)
+    extra_body = config.get("llm_extra_body")
+    if extra_body:
+        # Write raw JSON string without quotes - daemon expects valid JSON
+        env_values["HINDSIGHT_API_LLM_EXTRA_BODY"] = extra_body if isinstance(extra_body, str) else str(extra_body)
 
     idle_timeout = (
         config.get("idle_timeout")
@@ -436,6 +483,26 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         env_values["HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT"] = str(
             _parse_int_setting(idle_timeout, _DEFAULT_IDLE_TIMEOUT)
         )
+
+    # Propagate ALL HINDSIGHT_* keys from config.json to .env
+    for k, v in config.items():
+        if k.startswith("HINDSIGHT_"):
+            # For JSON-like values (extra_body, headers), write raw string without quotes
+            if isinstance(v, str) and v.startswith(("'", '"', '{', '[')):
+                env_values[k] = v.strip("'\"")
+            else:
+                env_values[k] = str(v)
+
+    # Propagate HF_HUB_OFFLINE (prevents HuggingFace download hang in China)
+    hf_offline = config.get("HF_HUB_OFFLINE")
+    if hf_offline is not None:
+        env_values["HF_HUB_OFFLINE"] = str(hf_offline)
+
+    # Propagate consolidation throttling
+    consolidation_concurrent = config.get("consolidation_llm_max_concurrent")
+    if consolidation_concurrent is not None:
+        env_values["HINDSIGHT_API_CONSOLIDATION_LLM_MAX_CONCURRENT"] = str(consolidation_concurrent)
+
     return env_values
 
 
@@ -450,8 +517,19 @@ def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: st
     profile_env = _embedded_profile_env_path(config)
     profile_env.parent.mkdir(parents=True, exist_ok=True)
     env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
+    # Quote values containing shell-special chars, but NOT JSON values
+    # JSON values like {"reasoning_effort": "none"} must stay unquoted for json.loads()
+    _json_keys = {"HINDSIGHT_API_LLM_EXTRA_BODY", "HINDSIGHT_API_LLM_DEFAULT_HEADERS",
+                  "HINDSIGHT_API_LLM_GEMINI_SAFETY_SETTINGS", "HINDSIGHT_API_LLM_LITELLMROUTER_CONFIG"}
+    def _safe_env_value(key: str, v: str) -> str:
+        if key in _json_keys:
+            return v  # Raw JSON - no quoting
+        if any(c in v for c in "{}()$`\"' \\\n"):
+            return "'" + v.replace("'", "'\\''") + "'"
+        return v
+
     profile_env.write_text(
-        "".join(f"{key}={value}\n" for key, value in env_values.items()),
+        "".join(f"{key}={_safe_env_value(key, value)}\n" for key, value in env_values.items()),
         encoding="utf-8",
     )
     return profile_env
@@ -897,6 +975,16 @@ class HindsightMemoryProvider(MemoryProvider):
                     raise ImportError(str(_e))
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
+
+                # Write .env BEFORE creating the client to prevent race condition:
+                # if sync_turn() triggers daemon startup before the background thread
+                # writes .env, the daemon reads stale/empty env vars and crashes.
+                # See: system reboot → embedded daemon starts with empty LLM_EXTRA_BODY.
+                _materialize_embedded_profile_env(
+                    self._config,
+                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", ""),
+                )
+
                 llm_provider = self._config.get("llm_provider", "")
                 if llm_provider in {"openai_compatible", "openrouter"}:
                     llm_provider = "openai"

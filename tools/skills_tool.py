@@ -574,9 +574,13 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
             filters out disabled skills.
 
     Returns:
-        List of skill metadata dicts (name, description, category).
+        List of skill metadata dicts (name, description, category, trigger_words).
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import (
+        extract_skill_trigger_words,
+        get_external_skills_dirs,
+        iter_skill_index_files,
+    )
 
     skills = []
     seen_names: set = set()
@@ -631,6 +635,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                     "name": name,
                     "description": description,
                     "category": category,
+                    "trigger_words": extract_skill_trigger_words(frontmatter),
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -650,7 +655,38 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def _matches_query(skill: Dict[str, Any], query: str) -> bool:
+    """Check if a skill matches a search query.
+
+    Matches against:
+      - skill name (substring)
+      - skill description (substring)
+      - trigger_words (exact or substring)
+      - category name (substring)
+
+    All matching is case-insensitive.
+    """
+    q = query.lower()
+    # Check name
+    name = skill.get("name") or ""
+    if q in name.lower():
+        return True
+    # Check description
+    desc = skill.get("description") or ""
+    if q in desc.lower():
+        return True
+    # Check category
+    cat = skill.get("category") or ""
+    if q in cat.lower():
+        return True
+    # Check trigger_words
+    for tw in skill.get("trigger_words", []):
+        if q in tw or tw in q:
+            return True
+    return False
+
+
+def skills_list(category: Optional[str] = None, query: Optional[str] = None, task_id: Optional[str] = None) -> str:
     """
     List all available skills (progressive disclosure tier 1 - minimal metadata).
 
@@ -659,6 +695,8 @@ def skills_list(category: str = None, task_id: str = None) -> str:
 
     Args:
         category: Optional category filter (e.g., "mlops")
+        query: Optional search query to filter skills by keyword (matches name,
+               description, trigger_words, and category)
         task_id: Optional task identifier used to probe the active backend
 
     Returns:
@@ -694,6 +732,10 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         # Filter by category if specified
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
+
+        # Filter by query if specified
+        if query:
+            all_skills = [s for s in all_skills if _matches_query(s, query)]
 
         # Sort by category then name
         all_skills = _sort_skills(all_skills)
@@ -1468,14 +1510,18 @@ if __name__ == "__main__":
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
+    "description": "List available skills (name + description). Use skill_view(name) to load full content. Supports keyword search via query parameter.",
     "parameters": {
         "type": "object",
         "properties": {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
-            }
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional search query to find skills by keyword (matches name, description, trigger words, and category)",
+            },
         },
         "required": [],
     },
@@ -1505,7 +1551,9 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(
-        category=args.get("category"), task_id=kw.get("task_id")
+        category=args.get("category"),
+        query=args.get("query"),
+        task_id=kw.get("task_id"),
     ),
     check_fn=check_skills_requirements,
     emoji="📚",

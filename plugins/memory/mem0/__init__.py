@@ -468,8 +468,20 @@ class Mem0MemoryProvider(MemoryProvider):
                         logger.info("Conflict check: sim=%.3f, entity_type=%s, reason=%s",
                                    cos_sim, entity_type, reason)
                         if is_cc:
+                            # Guard: if entity type is 'version' but values are identical, downgrade to medium
+                            if entity_type == 'version':
+                                clean_a2 = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', '', mem_text)
+                                clean_b2 = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b', '', kept_mem.get('memory', ''))
+                                va2 = re.findall(r'(\d+\.\d+(?:\.\d+)?)', clean_a2, re.I)
+                                vb2 = re.findall(r'(\d+\.\d+(?:\.\d+)?)', clean_b2, re.I)
+                                if va2 and vb2 and set(va2) & set(vb2):
+                                    conflict_level = 'medium'
+                                elif cos_sim >= 0.85:
+                                    conflict_level = 'high'
+                                else:
+                                    conflict_level = 'medium'
                             # Entity type tiering: endpoint → always HIGH; version/path → needs cs≥0.85
-                            if entity_type == 'endpoint':
+                            elif entity_type == 'endpoint':
                                 conflict_level = 'high'
                             elif entity_type in ('version', 'path', 'hostname'):
                                 if cos_sim >= 0.85:

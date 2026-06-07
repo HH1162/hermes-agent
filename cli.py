@@ -3224,6 +3224,7 @@ class HermesCLI:
         self._agent_running = False
         self._pending_input = queue.Queue()
         self._interrupt_queue = queue.Queue()
+        self._notification_buffer = ""          # Buffered system notifications to prepend to next user message
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
         # don't auto-queue another continuation on top of a user-cancelled
@@ -12795,6 +12796,7 @@ class HermesCLI:
         self._agent_running = False
         self._pending_input = queue.Queue()     # For normal input (commands + new queries)
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
+        self._notification_buffer = ""          # Buffered system notifications to prepend to next user message
         # See constructor note. Mirrored here for the run() path that skips
         # the earlier __init__ branch.
         self._last_turn_interrupted = False
@@ -14657,21 +14659,23 @@ class HermesCLI:
                         # Periodic config watcher — auto-reload MCP on mcp_servers change
                         if not self._agent_running:
                             self._check_config_mcp_changes()
-                            # Check for background process notifications (completions
-                            # and watch pattern matches) while agent is idle.
+                            # Buffer background process notifications (completions
+                            # and watch pattern matches) — do NOT put into _pending_input
+                            # as they would trigger independent LLM calls. Instead,
+                            # buffer them to prepend to the next real user message.
                             try:
                                 from tools.process_registry import process_registry
                                 for _evt, _synth in process_registry.drain_notifications():
-                                    if isinstance(_synth, str):
+                                    if isinstance(_synth, str) and _synth.strip():
                                         wrapped = (
                                             "[SYSTEM NOTIFICATION - Background task status]\n"
                                             f"{_synth}\n"
                                             "[END SYSTEM NOTIFICATION]\n"
-                                            "(Note: This is an automated system event, not a user message.)"
                                         )
-                                        self._pending_input.put(wrapped)
-                                    else:
-                                        self._pending_input.put(_synth)
+                                        self._notification_buffer += wrapped + "\n"
+                                        # Cap buffer at 2000 chars to prevent memory growth
+                                        if len(self._notification_buffer) > 2000:
+                                            self._notification_buffer = self._notification_buffer[-1500:]
                             except Exception:
                                 pass
                         continue
@@ -14744,6 +14748,15 @@ class HermesCLI:
                     paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
                     if paste_refs:
                         user_input = self._expand_paste_references(user_input)
+
+                    # Inject buffered system notifications as context for this user message.
+                    # Notifications are NOT sent to the LLM independently — they are
+                    # prepended to the next real user message so the agent is informed
+                    # without generating spurious responses to background events.
+                    if self._notification_buffer and isinstance(user_input, str):
+                        user_input = self._notification_buffer + user_input
+                        self._notification_buffer = ""  # Consume buffer
+
                     print()
                     self._print_user_message_preview(user_input)
                     
@@ -14794,21 +14807,22 @@ class HermesCLI:
                                     _cprint(f"{_DIM}Voice auto-restart failed: {e}{_RST}")
                             threading.Thread(target=_restart_recording, daemon=True).start()
 
-                        # Drain process notifications (completions + watch matches)
-                        # that arrived while the agent was running.
+                        # Buffer process notifications (completions + watch matches)
+                        # that arrived while the agent was running — do NOT put into
+                        # _pending_input as they would trigger independent LLM calls.
                         try:
                             from tools.process_registry import process_registry
                             for _evt, _synth in process_registry.drain_notifications():
-                                if isinstance(_synth, str):
+                                if isinstance(_synth, str) and _synth.strip():
                                     wrapped = (
                                         "[SYSTEM NOTIFICATION - Background task status]\n"
                                         f"{_synth}\n"
                                         "[END SYSTEM NOTIFICATION]\n"
-                                        "(Note: This is an automated system event, not a user message.)"
                                     )
-                                    self._pending_input.put(wrapped)
-                                else:
-                                    self._pending_input.put(_synth)
+                                    self._notification_buffer += wrapped + "\n"
+                                    # Cap buffer at 2000 chars to prevent memory growth
+                                    if len(self._notification_buffer) > 2000:
+                                        self._notification_buffer = self._notification_buffer[-1500:]
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 

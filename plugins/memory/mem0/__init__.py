@@ -52,11 +52,11 @@ def _load_config() -> dict:
         "rerank": True,
         "keyword_search": False,
         # Local mode paths — local defaults overridden by mem0.json/env vars
-        "mem0_server": os.environ.get("MEM0_SERVER", "/media/data/mem0/mem0_server.py"),
-        "mem0_python": os.environ.get("MEM0_PYTHON", "/media/data/mem0/.venv/bin/python"),
+        "mem0_server": os.environ.get("MEM0_SERVER", "/opt/mem0/mem0_server.py"),
+        "mem0_python": os.environ.get("MEM0_PYTHON", "/opt/mem0/.venv/bin/python"),
         "llm_base_url": os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
         "llm_model": os.environ.get("LLM_MODEL", "qwen3"),
-        "embedder_model": os.environ.get("EMBEDDER_MODEL", "/home/herocco/bge/bge-large-zh-v1.5"),
+        "embedder_model": os.environ.get("EMBEDDER_MODEL", "/opt/models/bge-large-zh-v1.5"),
         "embedding_dims": int(os.environ.get("EMBEDDING_DIMS", "1024")),
         "qdrant_host": os.environ.get("QDRANT_HOST", "localhost"),
         "qdrant_port": int(os.environ.get("QDRANT_PORT", "6333")),
@@ -197,7 +197,7 @@ class Mem0MemoryProvider(MemoryProvider):
                         'embedder': {
                             'provider': 'huggingface',
                             'config': {
-                                'model': cfg.get("embedder_model", "/home/herocco/bge/bge-large-zh-v1.5")
+                                'model': cfg.get("embedder_model", "/opt/models/bge-large-zh-v1.5")
                             }
                         },
                         'vector_store': {
@@ -609,8 +609,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 
                 # Get paths from config (with local defaults)
                 cfg = _load_config()
-                MEM0_SERVER = cfg.get("mem0_server", "/media/data/mem0/mem0_server.py")
-                MEM0_PYTHON = cfg.get("mem0_python", "/media/data/mem0/.venv/bin/python")
+                MEM0_SERVER = cfg.get("mem0_server", "/opt/mem0/mem0_server.py")
+                MEM0_PYTHON = cfg.get("mem0_python", "/opt/mem0/.venv/bin/python")
 
                 def run_with_retry(cmd, timeout=30, max_retries=3):
                     """Run subprocess with exponential backoff retry."""
@@ -652,8 +652,8 @@ class Mem0MemoryProvider(MemoryProvider):
 
                 # Apply shared deduplication + conflict detection + track freezing
                 cfg = _load_config()
-                MEM0_SERVER = cfg.get("mem0_server", "/media/data/mem0/mem0_server.py")
-                MEM0_PYTHON = cfg.get("mem0_python", "/media/data/mem0/.venv/bin/python")
+                MEM0_SERVER = cfg.get("mem0_server", "/opt/mem0/mem0_server.py")
+                MEM0_PYTHON = cfg.get("mem0_python", "/opt/mem0/.venv/bin/python")
 
                 top_k_inject = 5
                 lines, kept_ids, shadow_ids = self._advanced_dedup_and_format(
@@ -737,8 +737,8 @@ class Mem0MemoryProvider(MemoryProvider):
                 
                 # Get paths from config (with local defaults)
                 cfg = _load_config()
-                MEM0_SERVER = cfg.get("mem0_server", "/media/data/mem0/mem0_server.py")
-                MEM0_PYTHON = cfg.get("mem0_python", "/media/data/mem0/.venv/bin/python")
+                MEM0_SERVER = cfg.get("mem0_server", "/opt/mem0/mem0_server.py")
+                MEM0_PYTHON = cfg.get("mem0_python", "/opt/mem0/.venv/bin/python")
 
                 result = subprocess.run(
                     [

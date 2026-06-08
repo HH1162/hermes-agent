@@ -3422,6 +3422,10 @@ def _notification_poller_loop(
                 process_registry.completion_queue.put(evt)
                 continue
             session["running"] = True
+            # FIX: mark completion as consumed BEFORE submitting to LLM,
+            # so that re-queued copies and drain_notifications will skip it.
+            if evt.get("type") == "completion":
+                process_registry._completion_consumed.add(_evt_sid)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
@@ -3859,6 +3863,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             from tools.process_registry import process_registry
 
             for _evt, synth in process_registry.drain_notifications():
+                # FIX: skip events already consumed by the poller
+                _evt_sid = _evt.get("session_id", "")
+                if _evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+                    continue
                 with session["history_lock"]:
                     if session.get("running"):
                         process_registry.completion_queue.put(_evt)

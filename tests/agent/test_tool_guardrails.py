@@ -207,7 +207,7 @@ def test_all_tools_no_progress_warns_without_blocking_by_default():
 
 
 def test_hard_stop_enabled_nudges_then_blocks_no_progress():
-    """With hard_stop enabled, first hit returns nudge (lets tool run + injects user message),
+    """With hard_stop enabled, first hit returns nudge (lets tool run + delivers guidance via /steer),
     after 2 consecutive nudges still repeating → truly blocks."""
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(

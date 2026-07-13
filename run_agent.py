@@ -4059,10 +4059,16 @@ class AIAgent:
         return function_result
 
     def _take_nudge_and_inject(self, messages: list) -> None:
-        """Check for pending nudge from guardrail and inject user message."""
+        """Check for pending nudge from guardrail and deliver via /steer.
+
+        Instead of inserting a synthetic role=user message (which breaks
+        strict role alternation and provider tool-call sequencing), we
+        queue the nudge text into _pending_steer so it is appended to the
+        last tool result by apply_pending_steer_to_tool_results().
+        """
         nudge = self._tool_guardrails.take_pending_nudge
         if nudge is not None:
-            messages.append({"role": "user", "content": nudge.message})
+            self._pending_steer = nudge.message
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)

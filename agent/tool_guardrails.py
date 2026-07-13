@@ -295,11 +295,17 @@ class ToolCallGuardrailController:
                     self._halt_decision = decision
                     return decision
                 else:
-                    # Nudge: let the tool execute but inject a user message after
+                    # Nudge: let the tool execute, then deliver guidance via
+                    # the /steer mechanism (appended to the last tool result).
                     self._pending_nudge = ToolGuardrailDecision(
                         action="nudge",
                         code="no_progress_nudge",
-                        message="Are you stuck in a loop?",
+                        message=(
+                            f"You appear to be stuck repeating {tool_name} "
+                            f"(same result {repeat_count} times). Stop repeating "
+                            f"it unchanged. Use the result you already have or "
+                            f"try a fundamentally different approach."
+                        ),
                         tool_name=tool_name,
                         count=repeat_count,
                         signature=signature,

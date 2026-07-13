@@ -446,7 +446,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
         messages.append(make_tool_result_message(name, _tool_content, tc.id))
 
-        # Inject nudge user message if guardrail detected a loop
+        # Deliver guardrail nudge via /steer (appended to this tool result).
         agent._take_nudge_and_inject(messages)
 
         # ── Per-tool /steer drain ───────────────────────────────────
@@ -865,7 +865,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         messages.append(make_tool_result_message(function_name, _tool_content, tool_call.id))
 
-        # Inject nudge user message if guardrail detected a loop
+        # Deliver guardrail nudge via /steer (appended to this tool result).
         agent._take_nudge_and_inject(messages)
 
         # ── Per-tool /steer drain ───────────────────────────────────

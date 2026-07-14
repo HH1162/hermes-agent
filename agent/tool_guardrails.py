@@ -301,10 +301,11 @@ class ToolCallGuardrailController:
                         action="nudge",
                         code="no_progress_nudge",
                         message=(
-                            f"You appear to be stuck repeating {tool_name} "
-                            f"(same result {repeat_count} times). Stop repeating "
-                            f"it unchanged. Use the result you already have or "
-                            f"try a fundamentally different approach."
+                            f"STOP. You have called {tool_name} {repeat_count} times and "
+                            f"got the exact same result each time. Repeating it again "
+                            f"will not help. Change your approach: use the result you "
+                            f"already have, try different arguments, or switch to a "
+                            f"different tool entirely."
                         ),
                         tool_name=tool_name,
                         count=repeat_count,

@@ -273,7 +273,7 @@ class ToolCallGuardrailController:
         record = self._no_progress.get(signature)
         if record is not None:
             _result_hash, repeat_count = record
-            block_threshold = self._get_no_progress_block_after(tool_name)
+            block_threshold = self._get_no_progress_block_after(tool_name, args)
             nudge_count = self._no_progress_nudge.get(signature, 0)
             if repeat_count >= block_threshold:
                 # First time reaching threshold: nudge (inject user message, don't block)
@@ -393,7 +393,7 @@ class ToolCallGuardrailController:
         if repeat_count == 1:
             self._no_progress_nudge.pop(signature, None)
 
-        warn_threshold = self._get_no_progress_warn_after(tool_name)
+        warn_threshold = self._get_no_progress_warn_after(tool_name, args)
         if self.config.warnings_enabled and repeat_count >= warn_threshold:
             return ToolGuardrailDecision(
                 action="warn",
@@ -410,15 +410,20 @@ class ToolCallGuardrailController:
 
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
 
-    def _get_no_progress_block_after(self, tool_name: str) -> int:
-        """Browser tools use higher threshold (30) to avoid false positives."""
+    def _get_no_progress_block_after(self, tool_name: str, tool_args: Mapping[str, Any] | None = None) -> int:
+        """Browser tools and process(poll) use higher threshold (30) to avoid false positives."""
         if tool_name.startswith("browser_"):
+            return 30
+        # Allow process(poll) to loop more times for monitoring long tasks
+        if tool_name == "process" and tool_args and tool_args.get("action") == "poll":
             return 30
         return self.config.no_progress_block_after
 
-    def _get_no_progress_warn_after(self, tool_name: str) -> int:
-        """Browser tools use higher warn threshold (15)."""
+    def _get_no_progress_warn_after(self, tool_name: str, tool_args: Mapping[str, Any] | None = None) -> int:
+        """Browser tools and process(poll) use higher warn threshold (15)."""
         if tool_name.startswith("browser_"):
+            return 15
+        if tool_name == "process" and tool_args and tool_args.get("action") == "poll":
             return 15
         return self.config.no_progress_warn_after
 

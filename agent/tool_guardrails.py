@@ -251,6 +251,7 @@ class ToolCallGuardrailController:
         """
         self._no_progress_nudge.clear()
         self._pending_nudges.clear()
+        self._no_progress.clear()
 
     def take_pending_nudge(self, signature: str) -> "ToolGuardrailDecision | None":
         """Take and clear the pending nudge for a specific tool signature.

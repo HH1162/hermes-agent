@@ -2380,6 +2380,10 @@ class AIAgent:
         """
         if not text or not text.strip():
             return False
+        # User gave a new direction — clear progress tracking state so the
+        # next tool call starts fresh (nudge counters, pending nudges).
+        if hasattr(self, "_tool_guardrails"):
+            self._tool_guardrails.reset_progress_state()
         cleaned = text.strip()
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
@@ -4916,6 +4920,24 @@ class AIAgent:
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)
         return toolguard_synthetic_result(decision)
+
+    def _take_nudge_and_inject(self, messages: list, signature: str = "") -> None:
+        """Check for pending nudge from guardrail and deliver via /steer.
+
+        Instead of inserting a synthetic role=user message (which breaks
+        strict role alternation and provider tool-call sequencing), we
+        queue the nudge text into _pending_steer so it is appended to the
+        last tool result by apply_pending_steer_to_tool_results().
+
+        Args:
+            signature: Tool call signature hash to match the correct nudge
+                       (prevents cross-contamination in concurrent mode).
+        """
+        if not signature:
+            return
+        nudge = self._tool_guardrails.take_pending_nudge(signature)
+        if nudge is not None:
+            self._pending_steer = nudge.message
 
     def _execute_tool_calls(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls from the assistant message and append results to messages.

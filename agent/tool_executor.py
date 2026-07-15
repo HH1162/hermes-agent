@@ -528,10 +528,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail, sig))
 
     # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
+    tool_names_str = ", ".join(name for _, name, *_ in parsed_calls)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-        for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
+        for i, (tc, name, args, *_rest) in enumerate(parsed_calls, 1):
             display_args = _redact_tool_args_for_display(name, args) or args
             args_str = json.dumps(display_args, ensure_ascii=False)
             if agent.verbose_logging:
@@ -541,7 +541,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, _mt, block_result, *_rest in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_progress_callback:
@@ -552,7 +552,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, _mt, block_result, *_rest in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_start_callback:
@@ -565,7 +565,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
-    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail, sig) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
 
@@ -668,7 +668,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     try:
         runnable_calls = [
             (i, tc, name, args)
-            for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
+            for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail, sig) in enumerate(parsed_calls)
             if block_result is None
         ]
         futures = []

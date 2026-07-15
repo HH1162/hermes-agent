@@ -30,7 +30,7 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
-from agent.tool_guardrails import ToolGuardrailDecision
+from agent.tool_guardrails import ToolGuardrailDecision, ToolCallSignature, _coerce_args
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -448,87 +448,29 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 error_message=_ts_scope_block,
                 middleware_trace=list(middleware_trace),
             )
+        except Exception:
+            block_message = None
+
+        if block_message is not None:
+            block_result = json.dumps({"error": block_message}, ensure_ascii=False)
+            sig = ""
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
+            guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+            # _pending_nudges 用 args_hash 字符串作 key，需从 signature 对象提取
+            _sig_obj = getattr(guardrail_decision, 'signature', None)
+            sig = str(_sig_obj.args_hash) if _sig_obj else ""
+            if not guardrail_decision.allows_execution:
+                block_result = agent._guardrail_block_result(guardrail_decision)
+                blocked_by_guardrail = True
 
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
-                _emit_terminal_post_tool_call(
-                    agent,
-                    function_name=function_name,
-                    function_args=function_args,
-                    result=block_result,
-                    effective_task_id=effective_task_id,
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
-                    middleware_trace=list(middleware_trace),
-                )
-            else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
-                    _emit_terminal_post_tool_call(
-                        agent,
-                        function_name=function_name,
-                        function_args=function_args,
-                        result=block_result,
-                        effective_task_id=effective_task_id,
-                        tool_call_id=getattr(tool_call, "id", "") or "",
-                        status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
-                        middleware_trace=list(middleware_trace),
-                    )
-
-        # ── Checkpoint preflight (only for tools that will execute) ──
-        if block_result is None:
-            # Checkpoint for file-mutating tools
-            if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
-                try:
-                    file_path = function_args.get("path", "")
-                    if file_path:
-                        work_dir = agent._checkpoint_mgr.get_working_dir_for_path(file_path)
-                        agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
-                except Exception:
-                    pass
-
-            # Checkpoint before destructive terminal commands
-            if function_name == "terminal" and agent._checkpoint_mgr.enabled:
-                try:
-                    cmd = function_args.get("command", "")
-                    if _is_destructive_command(cmd):
-                        cwd = function_args.get("workdir") or os.getenv("TERMINAL_CWD", os.getcwd())
-                        agent._checkpoint_mgr.ensure_checkpoint(
-                            cwd, f"before terminal: {cmd[:60]}"
-                        )
-                except Exception:
-                    pass
-
-        parsed_calls.append((tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail))
+        parsed_calls.append((tool_call, function_name, function_args, block_result, blocked_by_guardrail, sig))
 
     # ── Logging / callbacks ──────────────────────────────────────────
-    tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
-    if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+    tool_names_str = ", ".join(name for _, name, *_ in parsed_calls)
+    if not agent.quiet_mode:
         print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
-        for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls, 1):
-            display_args = _redact_tool_args_for_display(name, args) or args
-            args_str = json.dumps(display_args, ensure_ascii=False)
+        for i, (tc, name, args, *_rest) in enumerate(parsed_calls, 1):
+            args_str = json.dumps(args, ensure_ascii=False)
             if agent.verbose_logging:
                 print(f"  📞 Tool {i}: {name}({list(display_args.keys())})")
                 print(agent._wrap_verbose("Args: ", json.dumps(display_args, indent=2, ensure_ascii=False)))
@@ -536,7 +478,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 args_preview = args_str[:agent.log_prefix_chars] + "..." if len(args_str) > agent.log_prefix_chars else args_str
                 print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
-    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, block_result, *_rest in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_progress_callback:
@@ -547,7 +489,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-    for tc, name, args, middleware_trace, block_result, blocked_by_guardrail in parsed_calls:
+    for tc, name, args, block_result, *_rest in parsed_calls:
         if block_result is not None:
             continue
         if agent.tool_start_callback:
@@ -560,7 +502,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
-    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, block_result, *_rest) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
 
@@ -662,62 +604,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     try:
         runnable_calls = [
-            (i, tc, name, args)
-            for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls)
+            (i, tc, name, args, sig)
+            for i, (tc, name, args, block_result, blocked_by_guardrail, sig) in enumerate(parsed_calls)
             if block_result is None
         ]
         futures = []
-        future_to_index = {}
-        timed_out_indices: set[int] = set()
-        timeout_s = _resolve_concurrent_tool_timeout()
-        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+        future_to_name = {}
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
-            # Daemon workers: an interrupted/timed-out batch is abandoned with
-            # shutdown(wait=False), but stdlib ThreadPoolExecutor workers are
-            # non-daemon and registered in concurrent.futures' atexit hook,
-            # which joins them unconditionally — so one wedged tool thread
-            # would block interpreter exit forever (multi-minute CLI exits).
-            from tools.daemon_pool import DaemonThreadPoolExecutor
-            executor = DaemonThreadPoolExecutor(max_workers=max_workers)
-            abandon_executor = False
-            try:
-                for submit_index, (i, tc, name, args) in enumerate(runnable_calls):
-                    # Propagate the agent turn's ContextVars (e.g.
-                    # _approval_session_key) AND thread-local approval/sudo
-                    # callbacks into the worker thread; clears callbacks on exit.
-                    try:
-                        f = executor.submit(
-                            propagate_context_to_thread(_run_tool), i, tc, name, args, parsed_calls[i][3]
-                        )
-                    except RuntimeError as submit_error:
-                        if not _is_interpreter_shutdown_submit_error(submit_error):
-                            raise
-                        skipped_calls = runnable_calls[submit_index:]
-                        logger.warning(
-                            "interpreter shutdown while scheduling concurrent tools; "
-                            "skipping %d unsubmitted tool(s)",
-                            len(skipped_calls),
-                        )
-                        for skipped_i, _tc, skipped_name, skipped_args in skipped_calls:
-                            if results[skipped_i] is None:
-                                middleware_trace = parsed_calls[skipped_i][3]
-                                result = (
-                                    f"Error executing tool '{skipped_name}': "
-                                    "Python interpreter is shutting down; tool was not started"
-                                )
-                                results[skipped_i] = (
-                                    skipped_name,
-                                    skipped_args,
-                                    result,
-                                    0.0,
-                                    True,
-                                    False,
-                                    middleware_trace,
-                                )
-                        break
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for i, tc, name, args, sig in runnable_calls:
+                    # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
+                    ctx = contextvars.copy_context()
+                    f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
                     futures.append(f)
-                    future_to_index[f] = i
+                    future_to_name[f] = name
 
                 # Wait for all to complete with periodic heartbeats so the
                 # gateway's inactivity monitor doesn't kill us during long
@@ -800,9 +701,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     # Heartbeat every ~30s (6 × 5s poll intervals)
                     if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
                         _still_running = [
-                            parsed_calls[future_to_index[f]][1]
+                            future_to_name[f]
                             for f in not_done
-                            if f in future_to_index
+                            if f in future_to_name
                         ]
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
@@ -826,7 +727,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             spinner.stop(f"⚡ {completed}/{num_tools} tools completed in {total_dur:.1f}s total")
 
     # ── Post-execution: display per-tool results ─────────────────────
-    for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
+    for i, (tc, name, args, block_result, blocked_by_guardrail, sig) in enumerate(parsed_calls):
         r = results[i]
         blocked = False
         # A worker can finish and write results[i] in the window between the
@@ -974,35 +875,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
-        tool_message = make_tool_result_message(
-            name,
-            _tool_content,
-            tc.id,
-            effect_disposition=effect_disposition,
-        )
-        messages.append(tool_message)
-        risk_metadata = tool_message.get("_tool_output_risk")
-        if (
-            risk_metadata is not None
-            and risk_metadata.get("risk") != "low"
-            and agent.tool_progress_callback
-        ):
-            try:
-                agent.tool_progress_callback(
-                    "tool.output_risk",
-                    name,
-                    None,
-                    None,
-                    tool_call_id=tc.id,
-                    risk_metadata=risk_metadata,
-                )
-            except Exception as cb_err:
-                logging.debug("Tool output risk callback error: %s", cb_err)
-        _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"tool result {name}",
-        )
+        messages.append(make_tool_result_message(name, _tool_content, tc.id))
+
+        # Deliver guardrail nudge via /steer (appended to this tool result).
+        agent._take_nudge_and_inject(messages, signature=sig)
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Same as the sequential path: drain between each collected
@@ -1128,8 +1004,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
+        _guardrail_sig = ""
         if _block_msg is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+            # _pending_nudges 用 args_hash 字符串作 key，需从 signature 对象提取
+            _sig_obj = getattr(guardrail_decision, 'signature', None)
+            _guardrail_sig = str(_sig_obj.args_hash) if _sig_obj else ""
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
@@ -1663,38 +1543,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
-        messages.append(tool_message)
-        risk_metadata = tool_message.get("_tool_output_risk")
-        if (
-            risk_metadata is not None
-            and risk_metadata.get("risk") != "low"
-            and agent.tool_progress_callback
-        ):
-            try:
-                agent.tool_progress_callback(
-                    "tool.output_risk",
-                    function_name,
-                    None,
-                    None,
-                    tool_call_id=tool_call.id,
-                    risk_metadata=risk_metadata,
-                )
-            except Exception as cb_err:
-                logging.debug("Tool output risk callback error: %s", cb_err)
-        _flush_session_db_after_tool_progress(
-            agent,
-            messages,
-            stage=f"tool result {function_name}",
-        )
+        messages.append(make_tool_result_message(function_name, _tool_content, tool_call.id))
+
+        # Deliver guardrail nudge via /steer (appended to this tool result).
+        agent._take_nudge_and_inject(messages, signature=_guardrail_sig)
 
         # ── Per-tool /steer drain ───────────────────────────────────
         # Drain pending steer BETWEEN individual tool calls so the
         # injection lands as soon as a tool finishes — not after the
         # entire batch.  The model sees it on the next API iteration.
         agent._apply_pending_steer_to_tool_results(messages, 1)
-
-        if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
+        if not agent.quiet_mode:
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
                 print(agent._wrap_verbose("Result: ", function_result))

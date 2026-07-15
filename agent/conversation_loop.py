@@ -662,6 +662,10 @@ def run_conversation(
         if agent._interrupt_requested:
             interrupted = True
             _turn_exit_reason = "interrupted_by_user"
+            # User interrupted — clear progress tracking state so the
+            # next turn starts fresh (nudge counters, pending nudges).
+            if hasattr(agent, "_tool_guardrails"):
+                agent._tool_guardrails.reset_progress_state()
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break

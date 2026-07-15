@@ -229,11 +229,37 @@ class ToolCallGuardrailController:
         self.reset_for_turn()
 
     def reset_for_turn(self) -> None:
+        """Reset all per-turn state at the start of a new turn."""
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._no_progress_nudge: dict[ToolCallSignature, int] = {}
+        self._pending_nudges: dict[str, ToolGuardrailDecision] = {}  # signature → nudge
         self._halt_decision: ToolGuardrailDecision | None = None
 
+    def reset_progress_state(self) -> None:
+        """Reset only progress-tracking state after user intervention (interrupt, /steer).
+
+        When a user interrupts or gives new direction via /steer, the previous
+        nudge counters and pending nudges should be discarded — the user's
+        intervention is a semantic reset of the agent's progress. However,
+        we keep _exact_failure_counts and _same_tool_failure_counts intact
+        since those track failures within the current execution context.
+
+        Pending nudges are cleared because their associated tool results
+        will never be collected (execution was interrupted).
+        """
+        self._no_progress_nudge.clear()
+        self._pending_nudges.clear()
+
+    def take_pending_nudge(self, signature: str) -> "ToolGuardrailDecision | None":
+        """Take and clear the pending nudge for a specific tool signature.
+
+        In concurrent mode, multiple tools may each trigger their own nudge
+        during pre-flight. This method ensures each tool's result gets only
+        its own nudge, preventing cross-contamination.
+        """
+        return self._pending_nudges.pop(signature, None)
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
@@ -279,6 +305,29 @@ class ToolCallGuardrailController:
                     )
                     self._halt_decision = decision
                     return decision
+                else:
+                    # Nudge: let the tool execute, then deliver guidance via
+                    # the /steer mechanism (appended to the tool result).
+                    # Store in per-signature dict to avoid cross-contamination
+                    # in concurrent mode where multiple tools may each trigger
+                    # their own nudge during pre-flight.
+                    nudge_decision = ToolGuardrailDecision(
+                        action="nudge",
+                        code="no_progress_nudge",
+                        message=(
+                            f"STOP. You have called {tool_name} {repeat_count} times and "
+                            f"got the exact same result each time. Repeating it again "
+                            f"will not help. Change your approach: use the result you "
+                            f"already have, try different arguments, or switch to a "
+                            f"different tool entirely."
+                        ),
+                        tool_name=tool_name,
+                        count=repeat_count,
+                        signature=signature,
+                    )
+                    self._pending_nudges[str(signature.args_hash)] = nudge_decision
+                    self._no_progress_nudge[signature] = nudge_count + 1
+                    return nudge_decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 

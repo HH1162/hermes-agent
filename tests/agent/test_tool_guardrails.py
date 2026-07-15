@@ -206,6 +206,8 @@ def test_idempotent_no_progress_repeated_result_warns_without_blocking_by_defaul
 
 
 def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
+    """With hard_stop enabled, first hit returns nudge (lets tool run + delivers guidance via /steer),
+    after 2 consecutive nudges still repeating → truly blocks."""
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(
             hard_stop_enabled=True,
@@ -223,9 +225,21 @@ def test_hard_stop_enabled_blocks_idempotent_no_progress_future_repeat():
     assert warn.action == "warn"
     assert warn.code == "idempotent_no_progress_warning"
 
+    # First threshold hit: nudge (allows execution)
+    nudge_check = controller.before_call("read_file", args)
+    assert nudge_check.allows_execution  # nudge allows execution
+    # Execute the tool (it still runs)
+    controller.after_call("read_file", args, result, failed=False)
+
+    # Second threshold hit: nudge again
+    nudge_check2 = controller.before_call("read_file", args)
+    assert nudge_check2.allows_execution
+    controller.after_call("read_file", args, result, failed=False)
+
+    # Third threshold hit: truly block
     blocked = controller.before_call("read_file", args)
     assert blocked.action == "block"
-    assert blocked.code == "idempotent_no_progress_block"
+    assert blocked.code == "no_progress_block"
 
 
 def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
@@ -250,7 +264,9 @@ def test_reset_for_turn_clears_bounded_guardrail_state():
     controller.after_call("read_file", {"path": "/tmp/x"}, "same", failed=False)
 
     assert controller.before_call("web_search", {"query": "same"}).action == "block"
-    assert controller.before_call("read_file", {"path": "/tmp/x"}).action == "block"
+    # read_file returns nudge on first threshold hit (allows execution)
+    nudge_check = controller.before_call("read_file", {"path": "/tmp/x"})
+    assert nudge_check.allows_execution
 
     controller.reset_for_turn()
 

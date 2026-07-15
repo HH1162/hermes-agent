@@ -154,7 +154,7 @@ class ToolGuardrailDecision:
 
     @property
     def allows_execution(self) -> bool:
-        return self.action in {"allow", "warn"}
+        return self.action in {"allow", "warn", "nudge"}
 
     @property
     def should_halt(self) -> bool:

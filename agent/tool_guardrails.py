@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -236,6 +237,8 @@ class ToolCallGuardrailController:
         self._no_progress_nudge: dict[ToolCallSignature, int] = {}
         self._pending_nudges: dict[str, ToolGuardrailDecision] = {}  # signature → nudge
         self._halt_decision: ToolGuardrailDecision | None = None
+        # Time-based poll frequency tracking (keyed by session_id from args)
+        self._poll_timestamps: dict[str, list[float]] = {}
 
     def reset_progress_state(self) -> None:
         """Reset only progress-tracking state after user intervention (interrupt, /steer).
@@ -268,6 +271,12 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+
+        # Time-based poll frequency check (always active, not gated by hard_stop)
+        poll_decision = self._check_poll_frequency(tool_name, args)
+        if poll_decision is not None:
+            return poll_decision
+
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -441,6 +450,52 @@ class ToolCallGuardrailController:
         if tool_name == "process" and tool_args and tool_args.get("action") == "poll":
             return 30
         return self.config.no_progress_block_after
+
+    # ------------------------------------------------------------------
+    # Time-based poll frequency detection
+    # ------------------------------------------------------------------
+
+    def _check_poll_frequency(
+        self, tool_name: str, tool_args: Mapping[str, Any] | None
+    ) -> "ToolGuardrailDecision | None":
+        """Detect rapid-fire process(poll) loops by tracking timestamps per session_id.
+
+        If the same session_id is polled more than POLL_MAX times within
+        POLL_WINDOW seconds, return a nudge decision to break the loop.
+        """
+        if tool_name != "process" or not tool_args or tool_args.get("action") != "poll":
+            return None
+
+        session_id = tool_args.get("session_id")
+        if not session_id:
+            return None
+
+        now = time.time()
+        POLL_WINDOW = 10.0   # seconds
+        POLL_MAX = 9          # max polls within window
+
+        timestamps = self._poll_timestamps.setdefault(session_id, [])
+        # Prune old entries outside the sliding window
+        cutoff = now - POLL_WINDOW
+        timestamps[:] = [t for t in timestamps if t > cutoff]
+
+        if len(timestamps) >= POLL_MAX:
+            return ToolGuardrailDecision(
+                action="nudge",
+                code="poll_frequency_exceeded",
+                message=(
+                    f"STOP. You have polled session '{session_id}' "
+                    f"{len(timestamps)}+ times in the last {int(POLL_WINDOW)} seconds. "
+                    "This is a rapid-fire loop. Wait at least 180 seconds between polls. "
+                    "Use the result you already have or switch to a different approach."
+                ),
+                tool_name=tool_name,
+                count=len(timestamps),
+            )
+
+        # Record this poll timestamp
+        timestamps.append(now)
+        return None
 
     def _get_no_progress_warn_after(self, tool_name: str, tool_args: Mapping[str, Any] | None = None) -> int:
         """Browser tools and process(poll) use higher warn threshold (15)."""
